@@ -79,6 +79,12 @@ The `outcome` label takes exactly three values:
 * `retryable_error` = HTTP 408, 429, any 5xx, or a failure before an HTTP status
 * `other_error` = everything else (400, 401, 403, 422, …)
 
+The router's failover set is broader than `retryable_error`: besides 408, 429, and 5xx it also
+tries another configured target on **403** (model access can differ by target) and on
+context-window overflows. A recovered 403 still counts as one `other_error` upstream attempt plus a
+`success` client response, so `error_rate_reduction` below (built on `retryable_error`) does not
+credit it.
+
 | Metric | Type | Meaning |
 |---|---|---|
 | `switchyard_client_responses_total{outcome}` | counter | HTTP responses returned to clients on the LLM-serving routes (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`). The denominator for the **router-served** error rate. |

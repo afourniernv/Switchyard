@@ -34,8 +34,9 @@ const MAX_ASSIGNMENTS: usize = 4096;
 
 /// The stable identity a model assignment is retained against.
 ///
-/// A sub-agent request is keyed by `session + agent` and a root request by session alone,
-/// so a sub-agent's assignment is scoped within — but distinct from — its session's.
+/// Either a [`RoutingIdentity`] derived from correlation metadata — which keys a root by session
+/// and an identified child by `session + agent` — or a hash of the first user message when the
+/// caller supplies no correlation metadata.
 #[derive(Clone, Hash, PartialEq, Eq)]
 enum AffinityKey {
     /// Correlation metadata supplied by the calling agent.
@@ -109,9 +110,9 @@ impl AffinityRouter {
     fn affinity_key(&self, request: &Request) -> Option<AffinityKey> {
         if let Some(identity) = routing_identity(request) {
             return match identity {
-                RoutingIdentity::Subagent { .. } => Some(AffinityKey::Routing(identity)),
+                // A root request abstains under subagents_only; every other identity is retained.
                 RoutingIdentity::Session(_) if self.subagents_only => None,
-                RoutingIdentity::Session(_) => Some(AffinityKey::Routing(identity)),
+                _ => Some(AffinityKey::Routing(identity)),
             };
         }
 

@@ -98,6 +98,7 @@ impl OverflowHistory {
     }
 }
 
+/// The number of targets this request is not barred from — the reachable pool size.
 fn eligible_targets(targets: &LlmTargetSet, ctx: &Context) -> usize {
     targets
         .targets()
@@ -328,8 +329,12 @@ where
             else {
                 return Err(error);
             };
-            selected.decision =
-                self.fallback_decision(&selected.target, &next, reason, selected.deciding.as_ref());
+            selected.decision = self.fallback_decision(
+                &selected.target.semantic_name,
+                &next.semantic_name,
+                reason,
+                selected.deciding.as_ref(),
+            );
             selected.target = next;
             driver.info(ctx.clone(), selected.decision.clone()).await?;
         }
@@ -338,26 +343,15 @@ where
     /// The decision published when a failed call sends the request to a different target.
     fn fallback_decision(
         &self,
-        from: &LlmTarget,
-        to: &LlmTarget,
+        from: &str,
+        to: &str,
         reason: RoutingFallbackReason,
         deciding: &dyn Classifier<S>,
     ) -> Arc<dyn Decision> {
-        let reasoning = if reason == RoutingFallbackReason::ContextWindow {
-            format!(
-                "{} exceeded its context window; fell back to {}",
-                from.semantic_name, to.semantic_name
-            )
-        } else {
-            format!(
-                "{} was unavailable; fell back to {}",
-                from.semantic_name, to.semantic_name
-            )
-        };
         Arc::new(FallThroughDecision {
-            selected_model: to.semantic_name.clone(),
-            reasoning,
-            tier: deciding.routing_tier(&to.semantic_name),
+            selected_model: to.to_string(),
+            reasoning: fallback_reasoning(reason, from, to),
+            tier: deciding.routing_tier(to),
             fallback_reason: Some(reason),
         })
     }
@@ -425,9 +419,10 @@ where
         let reasoning = if !skipped_excluded_target {
             (self.decision_reason)(&self.name, &score)
         } else {
-            format!(
-                "{} exceeded its context window; fell back to {}",
-                score.target, target.semantic_name
+            fallback_reasoning(
+                RoutingFallbackReason::ContextWindow,
+                &score.target,
+                &target.semantic_name,
             )
         };
         let decision: Arc<dyn Decision> = Arc::new(FallThroughDecision {
@@ -460,6 +455,15 @@ where
             },
             served,
         ))
+    }
+}
+
+/// The rationale shown when routing sends a request past `from` on to `to`.
+fn fallback_reasoning(reason: RoutingFallbackReason, from: &str, to: &str) -> String {
+    if reason == RoutingFallbackReason::ContextWindow {
+        format!("{from} exceeded its context window; fell back to {to}")
+    } else {
+        format!("{from} was unavailable; fell back to {to}")
     }
 }
 
