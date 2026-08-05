@@ -1365,6 +1365,69 @@ async fn all_inbound_formats_fail_over_from_an_unavailable_target() -> TestResul
 }
 
 #[tokio::test]
+async fn a_streaming_request_fails_over_from_an_unavailable_target() -> TestResult {
+    // The unavailable target 503s before any stream starts, so failover picks the healthy
+    // target and the client receives its stream. This drives the streaming branch of
+    // usage_metrics::observe, which must record the fallback in the routing log exactly once.
+    let upstream = MockUpstream::start().await?;
+    let log_dir = tempfile::tempdir()?;
+    let log_path = log_dir.path().join("routing.jsonl");
+    let state = ordered_random_state(&upstream.base_url, "model/unavailable", "model/healthy")?
+        .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": ROUTE_MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        response
+            .headers
+            .get("x-model-router-selected-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("model/healthy")
+    );
+    // The client gets the healthy target's stream, well framed through teardown, and every
+    // frame names the served model — not the unavailable target it failed over from.
+    let body = response.text()?;
+    assert!(body.contains("hello"), "streamed body: {body}");
+    assert!(body.contains("data: [DONE]"), "stream not terminated: {body}");
+    let first = first_sse_event(body).ok_or("streaming failover produced no SSE data frames")?;
+    assert_eq!(first["model"].as_str(), Some("model/healthy"));
+
+    let calls = upstream.calls.lock().await;
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["model"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        ["model/unavailable", "model/healthy"]
+    );
+    assert_eq!(calls[1]["stream"], json!(true));
+    drop(calls);
+
+    // The streaming path records the fallback once — not zero (dropped) and not twice (doubled).
+    let routing_records = std::fs::read_to_string(&log_path)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(routing_records.len(), 1);
+    assert_eq!(routing_records[0]["fallback_reason"], "unavailable");
+
+    let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
+    assert_eq!(stats["routing_fallbacks"]["unavailable"], 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn child_context_eviction_stays_with_the_identified_child() -> TestResult {
     let upstream = MockUpstream::start().await?;
     let state = ordered_random_state(&upstream.base_url, "model/weak", "model/strong")?;

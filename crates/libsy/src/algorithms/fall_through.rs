@@ -15,6 +15,14 @@
 //!
 //! Every composition retains one thing regardless: a target that overflows its context window is
 //! remembered under a root session or identified child agent and skipped on later turns.
+//!
+//! The two retained scopes differ on purpose. Composition state `S` — the conversation's turn
+//! count and accumulated signals, which drive escalation — is keyed by session ID, so every agent
+//! in a session reads and advances one conversation-level count. Overflow history and affinity are
+//! keyed per agent (a root by session, an identified child by `session + agent`), because whether
+//! a target fits or is reachable is specific to one agent's requests, not the whole conversation.
+//! An identified child therefore shares its session's turn count but keeps its own overflow and
+//! affinity state.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -361,7 +369,11 @@ where
         }
     }
 
-    /// Returns this request's retained state without holding the registry lock.
+    /// Returns this request's retained composition state, keyed by session ID and cloned out
+    /// so the caller locks the state itself without holding the registry lock.
+    ///
+    /// Composition state is conversation-scoped: every agent in a session shares it (see the
+    /// module docs). Per-agent isolation applies to overflow history and affinity, not here.
     fn session_state(&self, request: &Request) -> Option<Arc<AsyncMutex<S>>> {
         let states = self.session_states.as_ref()?;
         let session_id = session_id(request)?;
@@ -404,11 +416,13 @@ where
             });
         };
 
-        // 3. Resolve the target and publish the decision. When an excluded target sends
-        //    the request elsewhere, the tier and reasoning describe where it actually went.
+        // 3. Resolve the target and publish the decision. A target excluded before the call
+        //    — one already known to overflow for this identity and skipped on a later turn, or
+        //    one the caller excluded — redirects the request, and the tier and reasoning then
+        //    describe where it actually went.
         let target = self.targets.resolve_target(&score.target, ctx)?;
-        let used_context_fallback = target.semantic_name != score.target;
-        let reasoning = if !used_context_fallback {
+        let skipped_excluded_target = target.semantic_name != score.target;
+        let reasoning = if !skipped_excluded_target {
             (self.decision_reason)(&self.name, &score)
         } else {
             format!(
@@ -420,7 +434,11 @@ where
             selected_model: target.semantic_name.clone(),
             reasoning,
             tier: deciding.routing_tier(&target.semantic_name),
-            fallback_reason: used_context_fallback.then_some(RoutingFallbackReason::ContextWindow),
+            // No fallback_reason: the excluded target is skipped before any call this turn, so
+            // no fallback happened on this request. Recording one would re-count the original
+            // overflow on every later turn. Only call_llm_with_fallback — reacting to a target
+            // actually called and failing this request — records a reason.
+            fallback_reason: None,
         });
         driver.info(ctx.clone(), decision.clone()).await?;
 
@@ -1194,8 +1212,17 @@ mod tests {
         let router =
             FallThrough::<()>::new(target_set_with_overflow(&["weak", "strong"], &["weak"]))
                 .with_classifier(fixed(vec![score("weak", 0.9)]));
-        let (model, _) = run(router).await?;
+        let (model, trace) = run(router).await?;
         assert_eq!(model, "strong");
+        // A target called and overflowed this turn records a context-window fallback — unlike a
+        // pre-call skip of a known-overflowed target, which redirects but records nothing.
+        let last = trace
+            .last()
+            .ok_or_else(|| test_error("expected a published decision"))?;
+        assert_eq!(
+            last.fallback_reason(),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
         Ok(())
     }
 
@@ -1260,8 +1287,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_excluded_target_reports_the_target_it_fell_back_to() -> Result<()> {
-        // Headers and usage metrics read the decision, so it must describe the real call.
+    async fn a_pre_call_exclusion_redirects_without_recording_a_fallback() -> Result<()> {
+        // A target excluded before the call redirects the request, and the header and reasoning
+        // name where it went — but nothing was called and failed this turn, so the decision
+        // records no fallback_reason (which would otherwise re-count an earlier overflow on
+        // every later turn).
         let router = Arc::new(
             FallThrough::<()>::new(target_set(&["weak", "strong"]))
                 .with_classifier(fixed(vec![score("weak", 0.9)])),
@@ -1278,10 +1308,7 @@ mod tests {
 
         assert_eq!(text, "strong");
         assert_eq!(trace[0].selected_model(), "strong");
-        assert_eq!(
-            trace[0].fallback_reason(),
-            Some(RoutingFallbackReason::ContextWindow)
-        );
+        assert_eq!(trace[0].fallback_reason(), None);
         assert!(
             trace[0]
                 .reasoning()
