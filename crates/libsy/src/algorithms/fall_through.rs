@@ -35,6 +35,12 @@ use switchyard_protocol::{
 
 type SessionStates<S> = Mutex<HashMap<String, Arc<AsyncMutex<S>>>>;
 
+struct SelectedRoute<S> {
+    target: LlmTarget,
+    decision: Arc<dyn Decision>,
+    deciding: Arc<dyn Classifier<S>>,
+}
+
 /// Bounds process-local overflow history. Dropping a live identity costs one
 /// rediscovered overflow, so the victim choice does not need to be exact.
 const MAX_OVERFLOW_IDENTITIES: usize = 1_024;
@@ -245,7 +251,7 @@ where
         self.overflow_history
             .exclude(&mut ctx, &self.targets, identity.as_ref());
         let session_state = self.session_state(&request);
-        let (target, decision, served) = match session_state {
+        let (selected, served) = match session_state {
             Some(state) => {
                 let mut state = state.lock().await;
                 self.route(&mut state, &ctx, &driver, &mut request).await?
@@ -264,15 +270,8 @@ where
         match served {
             Some(response) => Ok(response),
             None => {
-                self.call_llm_with_fallback(
-                    ctx,
-                    &driver,
-                    target,
-                    decision,
-                    &request,
-                    identity.as_ref(),
-                )
-                .await
+                self.call_llm_with_fallback(ctx, &driver, selected, &request, identity.as_ref())
+                    .await
             }
         }
     }
@@ -286,14 +285,18 @@ where
         &self,
         mut ctx: Context,
         driver: &Driver,
-        mut target: LlmTarget,
-        mut decision: Arc<dyn Decision>,
+        mut selected: SelectedRoute<S>,
         request: &Request,
         identity: Option<&RoutingIdentity>,
     ) -> Result<Response> {
         loop {
             let result = driver
-                .call_llm_target(ctx.clone(), &target, request.clone(), decision.clone())
+                .call_llm_target(
+                    ctx.clone(),
+                    &selected.target,
+                    request.clone(),
+                    selected.decision.clone(),
+                )
                 .await;
             let Err(error) = result else { return result };
             let Some(reason) = fallback_reason(&error) else {
@@ -311,12 +314,16 @@ where
             } else {
                 self.invalidate_unavailable_target(request, failed);
             }
-            let Ok(next) = self.targets.resolve_target(&target.semantic_name, &ctx) else {
+            let Ok(next) = self
+                .targets
+                .resolve_target(&selected.target.semantic_name, &ctx)
+            else {
                 return Err(error);
             };
-            decision = self.fallback_decision(&target, &next, reason);
-            target = next;
-            driver.info(ctx.clone(), decision.clone()).await?;
+            selected.decision =
+                self.fallback_decision(&selected.target, &next, reason, selected.deciding.as_ref());
+            selected.target = next;
+            driver.info(ctx.clone(), selected.decision.clone()).await?;
         }
     }
 
@@ -326,6 +333,7 @@ where
         from: &LlmTarget,
         to: &LlmTarget,
         reason: RoutingFallbackReason,
+        deciding: &dyn Classifier<S>,
     ) -> Arc<dyn Decision> {
         let reasoning = if reason == RoutingFallbackReason::ContextWindow {
             format!(
@@ -341,10 +349,7 @@ where
         Arc::new(FallThroughDecision {
             selected_model: to.semantic_name.clone(),
             reasoning,
-            tier: self
-                .classifiers
-                .iter()
-                .find_map(|c| c.routing_tier(&to.semantic_name)),
+            tier: deciding.routing_tier(&to.semantic_name),
             fallback_reason: Some(reason),
         })
     }
@@ -373,7 +378,7 @@ where
         ctx: &Context,
         driver: &Driver,
         request: &mut Request,
-    ) -> Result<(LlmTarget, Arc<dyn Decision>, Option<Response>)> {
+    ) -> Result<(SelectedRoute<S>, Option<Response>)> {
         // 1. Processor chain accumulates request-side facts into the composition's state.
         for processor in &self.processors {
             processor.process(state, Event::Request(request)).await?;
@@ -382,13 +387,13 @@ where
         // 2. Fall through the cascade: the first classifier to score decides (argmax). The
         //    per-request driver is offered to each — driver-backed classifiers use it.
         let mut maybe_score: Option<Score> = None;
-        let mut deciding: Option<&Arc<dyn Classifier<S>>> = None;
+        let mut deciding: Option<Arc<dyn Classifier<S>>> = None;
         let mut served: Option<Response> = None;
         for classifier in &self.classifiers {
             let (scores, response) = classifier.score(state, request, Some(driver)).await?;
             maybe_score = scores.argmax(false)?;
             if maybe_score.is_some() {
-                deciding = Some(classifier);
+                deciding = Some(Arc::clone(classifier));
                 // Only the deciding classifier's response answers the turn; an abstaining
                 // classifier selected nothing for it to be the answer to.
                 served = response;
@@ -400,6 +405,7 @@ where
                 message: "every classifier abstained".to_string(),
             });
         };
+        let deciding = deciding.expect("a score always has a deciding classifier");
 
         // 3. Resolve the target and publish the decision. When an excluded target sends
         //    the request elsewhere, the tier and reasoning describe where it actually went.
@@ -416,7 +422,7 @@ where
         let decision: Arc<dyn Decision> = Arc::new(FallThroughDecision {
             selected_model: target.semantic_name.clone(),
             reasoning,
-            tier: deciding.and_then(|c| c.routing_tier(&target.semantic_name)),
+            tier: deciding.routing_tier(&target.semantic_name),
             fallback_reason: used_context_fallback.then_some(RoutingFallbackReason::ContextWindow),
         });
         driver.info(ctx.clone(), decision.clone()).await?;
@@ -431,7 +437,14 @@ where
             processor.process(state, event).await?;
         }
 
-        Ok((target, decision, served))
+        Ok((
+            SelectedRoute {
+                target,
+                decision,
+                deciding,
+            },
+            served,
+        ))
     }
 }
 
@@ -1056,6 +1069,49 @@ mod tests {
             }
         }
         assert_eq!(calls.lock().as_slice(), ["weak", "strong"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_the_deciding_classifier_tier() -> Result<()> {
+        struct TierClassifier {
+            scores: Vec<Score>,
+            tier: &'static str,
+        }
+
+        #[async_trait]
+        impl Classifier for TierClassifier {
+            async fn score(
+                &self,
+                _state: &mut (),
+                _request: &mut Request,
+                _driver: Option<&Driver>,
+            ) -> Result<(Classification, Option<Response>)> {
+                Ok((Classification::Scores(self.scores.clone()), None))
+            }
+
+            fn routing_tier(&self, _selected_model: &str) -> Option<&'static str> {
+                Some(self.tier)
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let router = FallThrough::<()>::new(availability_targets(calls, false))
+            .with_classifier(Arc::new(TierClassifier {
+                scores: Vec::new(),
+                tier: "abstaining",
+            }))
+            .with_classifier(Arc::new(TierClassifier {
+                scores: vec![score("weak", 1.0)],
+                tier: "deciding",
+            }));
+
+        let (model, trace) = run(router).await?;
+
+        assert_eq!(model, "strong");
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0].routing_tier(), Some("deciding"));
+        assert_eq!(trace[1].routing_tier(), Some("deciding"));
         Ok(())
     }
 
