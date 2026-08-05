@@ -386,26 +386,23 @@ where
 
         // 2. Fall through the cascade: the first classifier to score decides (argmax). The
         //    per-request driver is offered to each — driver-backed classifiers use it.
-        let mut maybe_score: Option<Score> = None;
-        let mut deciding: Option<Arc<dyn Classifier<S>>> = None;
+        let mut decided: Option<(Score, Arc<dyn Classifier<S>>)> = None;
         let mut served: Option<Response> = None;
         for classifier in &self.classifiers {
             let (scores, response) = classifier.score(state, request, Some(driver)).await?;
-            maybe_score = scores.argmax(false)?;
-            if maybe_score.is_some() {
-                deciding = Some(Arc::clone(classifier));
+            if let Some(score) = scores.argmax(false)? {
+                decided = Some((score, Arc::clone(classifier)));
                 // Only the deciding classifier's response answers the turn; an abstaining
                 // classifier selected nothing for it to be the answer to.
                 served = response;
                 break;
             }
         }
-        let Some(score) = maybe_score else {
+        let Some((score, deciding)) = decided else {
             return Err(LibsyError::AlgorithmError {
                 message: "every classifier abstained".to_string(),
             });
         };
-        let deciding = deciding.expect("a score always has a deciding classifier");
 
         // 3. Resolve the target and publish the decision. When an excluded target sends
         //    the request elsewhere, the tier and reasoning describe where it actually went.
