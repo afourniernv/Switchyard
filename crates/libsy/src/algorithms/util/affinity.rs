@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use switchyard_protocol::{Request, Role};
 
-use crate::core::algorithm::Driver;
+use crate::core::algorithm::{Driver, RoutingIdentity, routing_identity};
 use crate::core::classifier::{Classification, Classifier, Score};
 use crate::core::processor::{Event, Processor};
 
@@ -38,10 +38,10 @@ const MAX_ASSIGNMENTS: usize = 4096;
 /// so a sub-agent's assignment is scoped within — but distinct from — its session's.
 #[derive(Clone, Hash, PartialEq, Eq)]
 enum AffinityKey {
-    /// One model per session, for root-agent traffic.
-    Session(String),
-    /// One model per identified child agent within a session.
-    Subagent { session: String, agent: String },
+    /// Correlation metadata supplied by the calling agent.
+    Routing(RoutingIdentity),
+    /// First-user-message fallback for callers without correlation metadata.
+    MessageHash(String),
 }
 
 /// Retains a model per request identity and forces it on later matching requests.
@@ -107,18 +107,11 @@ impl AffinityRouter {
 
     /// Derives the stable identity this router should retain for `request`.
     fn affinity_key(&self, request: &Request) -> Option<AffinityKey> {
-        if let Some(metadata) = request.metadata.as_ref()
-            && let Some(session) = metadata.session_id.clone()
-        {
-            return if metadata.is_subagent {
-                metadata
-                    .agent_id
-                    .clone()
-                    .map(|agent| AffinityKey::Subagent { session, agent })
-            } else if self.subagents_only {
-                None
-            } else {
-                Some(AffinityKey::Session(session))
+        if let Some(identity) = routing_identity(request) {
+            return match identity {
+                RoutingIdentity::Subagent { .. } => Some(AffinityKey::Routing(identity)),
+                RoutingIdentity::Session(_) if self.subagents_only => None,
+                RoutingIdentity::Session(_) => Some(AffinityKey::Routing(identity)),
             };
         }
 
@@ -131,7 +124,7 @@ impl AffinityRouter {
             .then(|| {
                 first_user_message_hash(request).map(|hash| {
                     tracing::debug!(affinity_key = %hash, "affinity using message hash fallback");
-                    AffinityKey::Session(hash)
+                    AffinityKey::MessageHash(hash)
                 })
             })
             .flatten()
@@ -177,6 +170,16 @@ impl<S> Classifier<S> for AffinityRouter
 where
     S: Send + 'static,
 {
+    fn target_unavailable(&self, request: &Request, target: &str) {
+        let Some(key) = self.affinity_key(request) else {
+            return;
+        };
+        let mut assignments = self.assignments.lock();
+        if assignments.get(&key).is_some_and(|model| model == target) {
+            assignments.remove(&key);
+        }
+    }
+
     async fn score(
         &self,
         _state: &mut S,

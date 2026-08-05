@@ -76,6 +76,10 @@ pub trait Classifier<S = ()>: Send + Sync {
         None
     }
 
+    /// Invalidates retained routing state after `target` could not serve `request`.
+    /// Stateless classifiers do nothing.
+    fn target_unavailable(&self, _request: &Request, _target: &str) {}
+
     /// Score the classifier's targets given the current state and request.
     ///
     /// When present, `driver` lets a classifier offload model calls. It is `None`

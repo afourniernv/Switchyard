@@ -83,6 +83,25 @@ async fn upstream_chat(
     }
 
     let model = body["model"].as_str().unwrap_or("unknown").to_string();
+    if model == "model/weak" && body["messages"][0]["content"] == "overflow" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "request exceeds this model's context window"
+                }
+            })),
+        )
+            .into_response();
+    }
+    if model == "model/unavailable" {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {"message": "selected target is unavailable"}})),
+        )
+            .into_response();
+    }
     if body["stream"].as_bool() == Some(true) {
         if body["messages"][0]["content"] == "stream-error" {
             let events = [
@@ -243,6 +262,7 @@ async fn stats_exposes_the_exact_empty_schema_and_no_legacy_alias() -> TestResul
                 "p50_ms": 0.0,
                 "p99_ms": 0.0
             },
+            "routing_fallbacks": {},
             "classifier": {
                 "total_requests": 0,
                 "total_errors": 0,
@@ -346,6 +366,7 @@ async fn stats_reset_returns_confirmation_and_clears_all_stats() -> TestResult {
     assert_eq!(stats["models"], json!({}));
     assert_eq!(stats["tiers"], json!({}));
     assert_eq!(stats["routing_overhead"]["count"], 0);
+    assert_eq!(stats["routing_fallbacks"], json!({}));
     assert_eq!(stats["classifier"]["total_requests"], 0);
     assert_eq!(stats["classifier"]["models"], json!({}));
     Ok(())
@@ -506,8 +527,49 @@ fn load_test_config(toml: &str) -> TestResult<ServerState> {
     Ok(load_server_state(config.path())?)
 }
 
+fn ordered_random_state(base_url: &str, first: &str, second: &str) -> TestResult<ServerState> {
+    load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.mock]
+format = "openai_chat"
+base_url = "{base_url}"
+max_retries = 0
+
+[targets.first]
+id = "{first}"
+llm_client = "mock"
+
+[targets.second]
+id = "{second}"
+llm_client = "mock"
+
+[routes.random]
+id = "{ROUTE_MODEL}"
+type = "random"
+targets = ["first", "second"]
+weights = [1, 0]
+seed = 42
+"#,
+    ))
+}
+
 async fn send(app: &Router, method: &str, path: &str, body: Option<Value>) -> TestResult<Response> {
+    send_with_headers(app, method, path, body, &[]).await
+}
+
+async fn send_with_headers(
+    app: &Router,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> TestResult<Response> {
     let mut builder = HttpRequest::builder().method(method).uri(path);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
     let request_body = if let Some(body) = body {
         builder = builder.header("content-type", "application/json");
         Body::from(serde_json::to_vec(&body)?)
@@ -1224,6 +1286,157 @@ async fn all_inbound_formats_run_libsy_and_return_the_caller_format() -> TestRes
     let calls = upstream.calls.lock().await;
     assert_eq!(calls.len(), 3);
     assert!(calls.iter().all(|call| call["model"] == "model/a"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn all_inbound_formats_fail_over_from_an_unavailable_target() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let log_dir = tempfile::tempdir()?;
+    let log_path = log_dir.path().join("routing.jsonl");
+    let state = ordered_random_state(&upstream.base_url, "model/unavailable", "model/healthy")?
+        .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+    let cases = [
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": ROUTE_MODEL,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        ),
+        (
+            "/v1/messages",
+            json!({
+                "model": ROUTE_MODEL,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        ),
+        (
+            "/v1/responses",
+            json!({"model": ROUTE_MODEL, "input": "hi"}),
+        ),
+    ];
+
+    for (path, body) in cases {
+        let response = send(&app, "POST", path, Some(body)).await?;
+        assert_eq!(response.status, StatusCode::OK, "{path}");
+        assert_eq!(
+            response
+                .headers
+                .get("x-model-router-selected-model")
+                .and_then(|value| value.to_str().ok()),
+            Some("model/healthy"),
+            "{path}"
+        );
+        assert!(
+            response
+                .headers
+                .get("x-model-router-rationale")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|reason| reason.contains("unavailable")),
+            "{path}"
+        );
+    }
+
+    let calls = upstream.calls.lock().await;
+    assert_eq!(calls.len(), 6);
+    for pair in calls.chunks_exact(2) {
+        assert_eq!(pair[0]["model"], "model/unavailable");
+        assert_eq!(pair[1]["model"], "model/healthy");
+    }
+    drop(calls);
+
+    let routing_records = std::fs::read_to_string(&log_path)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(routing_records.len(), 3);
+    assert!(
+        routing_records
+            .iter()
+            .all(|record| record["fallback_reason"] == "unavailable")
+    );
+
+    let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
+    assert_eq!(stats["routing_fallbacks"]["unavailable"], 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn child_context_eviction_stays_with_the_identified_child() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let state = ordered_random_state(&upstream.base_url, "model/weak", "model/strong")?;
+    let app = build_switchyard_router(state);
+    let child_a = [
+        ("x-switchyard-session-id", "shared-session"),
+        ("x-switchyard-agent-id", "child-a"),
+        ("x-switchyard-is-subagent", "true"),
+    ];
+    let root = [
+        ("x-switchyard-session-id", "shared-session"),
+        ("x-switchyard-agent-id", "root"),
+        ("x-switchyard-is-subagent", "false"),
+    ];
+    let child_b = [
+        ("x-switchyard-session-id", "shared-session"),
+        ("x-switchyard-agent-id", "child-b"),
+        ("x-switchyard-is-subagent", "true"),
+    ];
+    let unidentified_child = [
+        ("x-switchyard-session-id", "shared-session"),
+        ("x-switchyard-is-subagent", "true"),
+    ];
+    let cases = [
+        ("overflow", child_a.as_slice(), "model/strong"),
+        ("fits", child_a.as_slice(), "model/strong"),
+        ("fits", root.as_slice(), "model/weak"),
+        ("fits", child_b.as_slice(), "model/weak"),
+        ("overflow", unidentified_child.as_slice(), "model/strong"),
+        ("overflow", unidentified_child.as_slice(), "model/strong"),
+    ];
+
+    for (content, headers, expected_model) in cases {
+        let response = send_with_headers(
+            &app,
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({
+                "model": ROUTE_MODEL,
+                "messages": [{"role": "user", "content": content}]
+            })),
+            headers,
+        )
+        .await?;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get("x-model-router-selected-model")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_model)
+        );
+    }
+
+    let calls = upstream.calls.lock().await;
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["model"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        [
+            "model/weak",
+            "model/strong",
+            "model/strong",
+            "model/weak",
+            "model/weak",
+            "model/weak",
+            "model/strong",
+            "model/weak",
+            "model/strong",
+        ]
+    );
     Ok(())
 }
 

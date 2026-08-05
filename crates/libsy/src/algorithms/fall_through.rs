@@ -14,21 +14,83 @@
 //! unretained per-run state.
 //!
 //! Every composition retains one thing regardless: a target that overflows its context window is
-//! remembered for the rest of its session and skipped on later turns.
+//! remembered under a root session or identified child agent and skipped on later turns.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::core::algorithm::{self, Algorithm, Driver, LlmTarget, LlmTargetSet, SessionEvictions};
+use crate::core::algorithm::{self, Algorithm, Driver, LlmTarget, LlmTargetSet, RoutingIdentity};
 use crate::core::classifier::{Classification, Classifier, Score};
 use crate::core::processor::{Event, Processor};
 use crate::{LibsyError, Result};
-use switchyard_protocol::{Context, Decision, Request, Response, RoutedLlmClient};
+use switchyard_protocol::{
+    Context, Decision, LlmClientError, Request, Response, RoutedLlmClient, RoutingFallbackReason,
+};
 
 type SessionStates<S> = Mutex<HashMap<String, Arc<AsyncMutex<S>>>>;
+
+/// Bounds process-local overflow history. Dropping a live identity costs one
+/// rediscovered overflow, so the victim choice does not need to be exact.
+const MAX_OVERFLOW_IDENTITIES: usize = 1_024;
+
+/// Targets that overflowed their context window, retained per root or child agent.
+#[derive(Default)]
+struct OverflowHistory {
+    identities: Mutex<HashMap<RoutingIdentity, HashSet<String>>>,
+}
+
+impl OverflowHistory {
+    /// Bars targets known not to fit this identity, while keeping one target reachable.
+    fn exclude(
+        &self,
+        ctx: &mut Context,
+        targets: &LlmTargetSet,
+        identity: Option<&RoutingIdentity>,
+    ) {
+        let Some(identity) = identity else { return };
+        let overflowed = self.identities.lock().get(identity).cloned();
+        let Some(overflowed) = overflowed else {
+            return;
+        };
+        for target in &overflowed {
+            // A later turn may be small enough to serve, so never seed the pool empty.
+            if eligible_targets(targets, ctx) <= 1 {
+                break;
+            }
+            ctx.exclude_target(target.clone());
+        }
+    }
+
+    /// Remembers that `target` overflowed for `identity`.
+    fn record(&self, identity: Option<&RoutingIdentity>, target: &str) {
+        let Some(identity) = identity else { return };
+        let mut identities = self.identities.lock();
+        if identities.len() >= MAX_OVERFLOW_IDENTITIES
+            && !identities.contains_key(identity)
+            && let Some(victim) = identities.keys().next().cloned()
+        {
+            identities.remove(&victim);
+        }
+        identities
+            .entry(identity.clone())
+            .or_default()
+            .insert(target.to_string());
+    }
+}
+
+fn eligible_targets(targets: &LlmTargetSet, ctx: &Context) -> usize {
+    targets
+        .targets()
+        .iter()
+        .filter(|target| !ctx.is_excluded(&target.semantic_name))
+        .count()
+}
 
 /// The decision a fall-through run produces: the selected model plus a human-readable reason.
 pub struct FallThroughDecision {
@@ -37,6 +99,7 @@ pub struct FallThroughDecision {
     /// Human-readable explanation of the selection.
     pub reasoning: String,
     tier: Option<&'static str>,
+    fallback_reason: Option<RoutingFallbackReason>,
 }
 
 impl Decision for FallThroughDecision {
@@ -46,6 +109,10 @@ impl Decision for FallThroughDecision {
 
     fn routing_tier(&self) -> Option<&str> {
         self.tier
+    }
+
+    fn fallback_reason(&self) -> Option<RoutingFallbackReason> {
+        self.fallback_reason
     }
 
     fn reasoning(&self) -> Option<&str> {
@@ -105,7 +172,7 @@ pub struct FallThrough<S = ()> {
     classifiers: Vec<Arc<dyn Classifier<S>>>,
     targets: LlmTargetSet,
     session_states: Option<SessionStates<S>>,
-    session_evictions: SessionEvictions,
+    overflow_history: OverflowHistory,
 }
 
 impl FallThrough<()> {
@@ -118,7 +185,7 @@ impl FallThrough<()> {
             classifiers: Vec::new(),
             targets,
             session_states: None,
-            session_evictions: SessionEvictions::default(),
+            overflow_history: OverflowHistory::default(),
         }
     }
 }
@@ -136,7 +203,7 @@ where
             classifiers: Vec::new(),
             targets,
             session_states: Some(Mutex::new(HashMap::new())),
-            session_evictions: SessionEvictions::default(),
+            overflow_history: OverflowHistory::default(),
         }
     }
 
@@ -173,14 +240,10 @@ where
         // The request is threaded mutably through the whole fold: any component may rewrite
         // it, later components see the rewrite, and the final value reaches the model.
         let mut request = request;
-        let session = session_id(&request);
+        let identity = algorithm::routing_identity(&request);
         let mut ctx = ctx;
-        algorithm::exclude_evicted(
-            &mut ctx,
-            &self.targets,
-            &self.session_evictions,
-            session.as_deref(),
-        );
+        self.overflow_history
+            .exclude(&mut ctx, &self.targets, identity.as_ref());
         let session_state = self.session_state(&request);
         let (target, decision, served) = match session_state {
             Some(state) => {
@@ -201,35 +264,96 @@ where
         match served {
             Some(response) => Ok(response),
             None => {
-                algorithm::call_llm_with_overflow_fallback(
+                self.call_llm_with_fallback(
                     ctx,
                     &driver,
-                    &self.targets,
                     target,
                     decision,
-                    request,
-                    session.as_deref(),
-                    &self.session_evictions,
-                    |from, to| self.fallback_decision(from, to),
+                    &request,
+                    identity.as_ref(),
                 )
                 .await
             }
         }
     }
 
-    /// The decision published when an overflow sends the request to a different target.
-    fn fallback_decision(&self, from: &LlmTarget, to: &LlmTarget) -> Arc<dyn Decision> {
-        Arc::new(FallThroughDecision {
-            selected_model: to.semantic_name.clone(),
-            reasoning: format!(
+    /// Calls `target`, falling back when another configured target may serve the request.
+    ///
+    /// Routing is not re-run: the replacement target receives the already-processed request.
+    /// Context overflows persist because conversations only grow; transient availability
+    /// failures affect this request and any matching sticky assignment only.
+    async fn call_llm_with_fallback(
+        &self,
+        mut ctx: Context,
+        driver: &Driver,
+        mut target: LlmTarget,
+        mut decision: Arc<dyn Decision>,
+        request: &Request,
+        identity: Option<&RoutingIdentity>,
+    ) -> Result<Response> {
+        loop {
+            let result = driver
+                .call_llm_target(ctx.clone(), &target, request.clone(), decision.clone())
+                .await;
+            let Err(error) = result else { return result };
+            let Some(reason) = fallback_reason(&error) else {
+                return Err(error);
+            };
+            let LibsyError::ClientCall { target: failed, .. } = &error else {
+                return Err(error);
+            };
+            // If every target was already tried, preserve the final concrete client error.
+            if !ctx.exclude_target(failed) {
+                return Err(error);
+            }
+            if reason == RoutingFallbackReason::ContextWindow {
+                self.overflow_history.record(identity, failed);
+            } else {
+                self.invalidate_unavailable_target(request, failed);
+            }
+            let Ok(next) = self.targets.resolve_target(&target.semantic_name, &ctx) else {
+                return Err(error);
+            };
+            decision = self.fallback_decision(&target, &next, reason);
+            target = next;
+            driver.info(ctx.clone(), decision.clone()).await?;
+        }
+    }
+
+    /// The decision published when a failed call sends the request to a different target.
+    fn fallback_decision(
+        &self,
+        from: &LlmTarget,
+        to: &LlmTarget,
+        reason: RoutingFallbackReason,
+    ) -> Arc<dyn Decision> {
+        let reasoning = if reason == RoutingFallbackReason::ContextWindow {
+            format!(
                 "{} exceeded its context window; fell back to {}",
                 from.semantic_name, to.semantic_name
-            ),
+            )
+        } else {
+            format!(
+                "{} was unavailable; fell back to {}",
+                from.semantic_name, to.semantic_name
+            )
+        };
+        Arc::new(FallThroughDecision {
+            selected_model: to.semantic_name.clone(),
+            reasoning,
             tier: self
                 .classifiers
                 .iter()
                 .find_map(|c| c.routing_tier(&to.semantic_name)),
+            fallback_reason: Some(reason),
         })
+    }
+
+    /// Clears sticky classifier state without replaying request or decision processors.
+    fn invalidate_unavailable_target(&self, request: &Request, target: &str) {
+        for classifier in &self.classifiers {
+            classifier.target_unavailable(request, target);
+        }
     }
 
     /// Returns this request's retained state without holding the registry lock.
@@ -280,7 +404,8 @@ where
         // 3. Resolve the target and publish the decision. When an excluded target sends
         //    the request elsewhere, the tier and reasoning describe where it actually went.
         let target = self.targets.resolve_target(&score.target, ctx)?;
-        let reasoning = if target.semantic_name == score.target {
+        let used_context_fallback = target.semantic_name != score.target;
+        let reasoning = if !used_context_fallback {
             (self.decision_reason)(&self.name, &score)
         } else {
             format!(
@@ -292,6 +417,7 @@ where
             selected_model: target.semantic_name.clone(),
             reasoning,
             tier: deciding.and_then(|c| c.routing_tier(&target.semantic_name)),
+            fallback_reason: used_context_fallback.then_some(RoutingFallbackReason::ContextWindow),
         });
         driver.info(ctx.clone(), decision.clone()).await?;
 
@@ -306,6 +432,27 @@ where
         }
 
         Ok((target, decision, served))
+    }
+}
+
+/// Returns the failures for which another configured target may serve the same request.
+fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
+    let LibsyError::ClientCall { source, .. } = error else {
+        return None;
+    };
+    match source {
+        LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
+        LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => {
+            Some(RoutingFallbackReason::Unavailable)
+        }
+        // Unlike a same-target transport retry, route failover can recover from a
+        // target-scoped access denial by trying a different configured target.
+        LlmClientError::UpstreamHttp { status, .. }
+            if matches!(*status, 403 | 408 | 429 | 500..=599) =>
+        {
+            Some(RoutingFallbackReason::Unavailable)
+        }
+        _ => None,
     }
 }
 
@@ -353,7 +500,7 @@ mod tests {
     use super::*;
     use crate::algorithms::util::prompts;
     use crate::core::classifier::Classification;
-    use crate::{SystemPromptProcessor, TargetPrompts};
+    use crate::{AffinityRouter, SystemPromptProcessor, TargetPrompts};
 
     use switchyard_protocol::{
         LlmClientError, LlmRequest, LlmResponse, Message, Metadata, Role, completion_text,
@@ -366,6 +513,57 @@ mod tests {
 
     fn test_error(message: &'static str) -> LibsyError {
         LibsyError::external("test", TestError(message))
+    }
+
+    #[test]
+    fn fallback_retries_only_target_availability_failures() {
+        let client_error = |source| LibsyError::client_call("weak", source);
+
+        for status in [403, 408, 429, 500, 503, 599] {
+            assert_eq!(
+                fallback_reason(&client_error(LlmClientError::UpstreamHttp {
+                    status,
+                    body: "unavailable".to_string(),
+                })),
+                Some(RoutingFallbackReason::Unavailable),
+                "HTTP {status} should try another target"
+            );
+        }
+        for status in [400, 401, 404, 409, 425] {
+            assert_eq!(
+                fallback_reason(&client_error(LlmClientError::UpstreamHttp {
+                    status,
+                    body: "request failed".to_string(),
+                })),
+                None,
+                "HTTP {status} should preserve the selected target's error"
+            );
+        }
+        assert_eq!(
+            fallback_reason(&client_error(LlmClientError::Transport {
+                source: Box::new(TestError("connection refused")),
+            })),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+        assert_eq!(
+            fallback_reason(&client_error(LlmClientError::Timeout {
+                source: Box::new(TestError("deadline exceeded")),
+            })),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+        assert_eq!(
+            fallback_reason(&client_error(LlmClientError::ContextWindowExceeded {
+                model: "weak".to_string(),
+                message: "too long".to_string(),
+            })),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        assert_eq!(
+            fallback_reason(&client_error(LlmClientError::InvalidRequest {
+                message: "bad request".to_string(),
+            })),
+            None
+        );
     }
 
     // --- fixtures ----------------------------------------------------------------------
@@ -710,6 +908,50 @@ mod tests {
         calls: Option<Arc<Mutex<Vec<String>>>>,
     }
 
+    /// Returns a target-specific availability error for weak and echoes every other target.
+    struct UnavailableClient {
+        calls: Arc<Mutex<Vec<String>>>,
+        fail_all: bool,
+    }
+
+    #[async_trait]
+    impl RoutedLlmClient for UnavailableClient {
+        async fn call(
+            &self,
+            _ctx: Context,
+            _request: Request,
+            decision: Arc<dyn Decision>,
+        ) -> std::result::Result<Response, LlmClientError> {
+            let model = decision.selected_model().to_string();
+            self.calls.lock().push(model.clone());
+            if model == "weak" || self.fail_all {
+                return Err(LlmClientError::UpstreamHttp {
+                    status: 503,
+                    body: format!("{model} is unavailable"),
+                });
+            }
+            Ok(Response {
+                llm_response: LlmResponse::Agg(text_response(None, model)),
+                metadata: None,
+            })
+        }
+    }
+
+    fn availability_targets(calls: Arc<Mutex<Vec<String>>>, fail_all: bool) -> LlmTargetSet {
+        LlmTargetSet::new(
+            ["weak", "strong"]
+                .into_iter()
+                .map(|name| LlmTarget {
+                    semantic_name: name.to_string(),
+                    llm_client: Some(Arc::new(UnavailableClient {
+                        calls: calls.clone(),
+                        fail_all,
+                    }) as Arc<dyn RoutedLlmClient>),
+                })
+                .collect(),
+        )
+    }
+
     #[async_trait]
     impl RoutedLlmClient for OverflowClient {
         async fn call(
@@ -786,6 +1028,67 @@ mod tests {
             assert_eq!(run_turn(&router).await?.0, "strong");
         }
         assert_eq!(calls.lock().iter().filter(|m| *m == "weak").count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausting_unavailable_targets_returns_the_final_client_error() -> Result<()> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let router = FallThrough::<()>::new(availability_targets(calls.clone(), true))
+            .with_classifier(fixed(vec![score("weak", 0.9)]));
+
+        let error = match run(router).await {
+            Err(error) => error,
+            Ok(_) => return Err(test_error("expected every target to fail")),
+        };
+        match error {
+            LibsyError::ClientCall {
+                target,
+                source: LlmClientError::UpstreamHttp { status: 503, body },
+            } => {
+                assert_eq!(target, "strong");
+                assert_eq!(body, "strong is unavailable");
+            }
+            other => {
+                return Err(LibsyError::AlgorithmError {
+                    message: format!("expected the final client error, got {other:?}"),
+                });
+            }
+        }
+        assert_eq!(calls.lock().as_slice(), ["weak", "strong"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_affinity_target_is_reclassified_on_the_next_turn() -> Result<()> {
+        struct SequenceClassifier(Mutex<Vec<&'static str>>);
+
+        #[async_trait]
+        impl Classifier for SequenceClassifier {
+            async fn score(
+                &self,
+                _state: &mut (),
+                _request: &mut Request,
+                _driver: Option<&Driver>,
+            ) -> Result<(Classification, Option<Response>)> {
+                let target = self.0.lock().remove(0);
+                Ok((Classification::Scores(vec![score(target, 1.0)]), None))
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let affinity = Arc::new(AffinityRouter::new());
+        let classifier = Arc::new(SequenceClassifier(Mutex::new(vec!["weak", "strong"])));
+        let router = Arc::new(
+            FallThrough::<()>::new(availability_targets(calls.clone(), false))
+                .with_processor(affinity.clone())
+                .with_classifier(affinity)
+                .with_classifier(classifier),
+        );
+
+        assert_eq!(run_turn(&router).await?.0, "strong");
+        assert_eq!(run_turn(&router).await?.0, "strong");
+        assert_eq!(calls.lock().as_slice(), ["weak", "strong", "strong"]);
         Ok(())
     }
 
@@ -922,6 +1225,10 @@ mod tests {
 
         assert_eq!(text, "strong");
         assert_eq!(trace[0].selected_model(), "strong");
+        assert_eq!(
+            trace[0].fallback_reason(),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
         assert!(
             trace[0]
                 .reasoning()

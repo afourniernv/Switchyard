@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use humantime::format_rfc3339_millis;
 use serde::{Deserialize, Serialize};
-use switchyard_protocol::Usage;
+use switchyard_protocol::{RoutingFallbackReason, Usage};
 
 use crate::usage_metrics::token_usage;
 use crate::{ServerError, ServerResult};
@@ -46,6 +46,7 @@ impl RoutingLog {
         context: RoutingLogContext,
         model: &str,
         tier: Option<&str>,
+        fallback_reason: Option<RoutingFallbackReason>,
         usage: &Usage,
     ) -> std::io::Result<()> {
         let usage = token_usage(usage);
@@ -56,6 +57,7 @@ impl RoutingLog {
             session_id: context.session_id.map(Cow::Owned),
             model: model.into(),
             tier: tier.unwrap_or("").into(),
+            fallback_reason: fallback_reason.map(|reason| reason.as_str().into()),
             prompt_tokens: usage.prompt_tokens,
             cached_tokens: usage.cached_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
@@ -127,6 +129,8 @@ struct RoutingRecord<'a> {
     session_id: Option<Cow<'a, str>>,
     model: Cow<'a, str>,
     tier: Cow<'a, str>,
+    #[serde(borrow, skip_serializing_if = "Option::is_none")]
+    fallback_reason: Option<Cow<'a, str>>,
     prompt_tokens: u64,
     cached_tokens: u64,
     cache_creation_tokens: u64,

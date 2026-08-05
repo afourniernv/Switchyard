@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
 use serde::Serialize;
+use switchyard_protocol::RoutingFallbackReason;
 
 use super::cache_eligibility::PrefixProbe;
 
@@ -103,6 +104,16 @@ impl StatsAccumulator {
         self.lock().routing_overhead.record(routing_overhead_ms);
     }
 
+    /// Records why routing replaced a selected target.
+    pub(crate) fn record_routing_fallback(&self, reason: RoutingFallbackReason) {
+        let mut inner = self.lock();
+        let count = inner
+            .routing_fallbacks
+            .entry(reason.as_str().to_string())
+            .or_default();
+        *count = count.saturating_add(1);
+    }
+
     /// Records one successful classifier or judge call.
     pub(crate) fn record_classifier_success(
         &self,
@@ -168,6 +179,7 @@ struct StatsAccumulatorInner {
     total_requests: u64,
     total_errors: u64,
     routing_overhead: LatencyHistogram,
+    routing_fallbacks: BTreeMap<String, u64>,
     by_classifier: BTreeMap<String, ModelStats>,
     classifier_requests: u64,
     classifier_errors: u64,
@@ -202,6 +214,7 @@ impl StatsAccumulatorInner {
             models,
             tiers: tier_snapshots(&self.by_tier, total_tokens.total, self.total_requests),
             routing_overhead: self.routing_overhead.snapshot(),
+            routing_fallbacks: self.routing_fallbacks.clone(),
             classifier,
         }
     }
@@ -330,6 +343,7 @@ pub(crate) struct StatsSnapshot {
     pub models: BTreeMap<String, ModelStatsSnapshot>,
     pub tiers: BTreeMap<String, TierStatsSnapshot>,
     pub routing_overhead: LatencyHistogramSnapshot,
+    pub routing_fallbacks: BTreeMap<String, u64>,
     pub classifier: ClassifierStatsSnapshot,
 }
 

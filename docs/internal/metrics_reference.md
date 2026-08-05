@@ -17,6 +17,8 @@ a drop-in scrape config and starter alert rules.
 `GET /metrics` is served by `switchyard-server`.
 
 A JSON summary of the same traffic lives at `GET /v1/stats`.
+Its `routing_fallbacks` object counts target replacements by reason: `context_window` or
+`unavailable`.
 
 ## Top-line gauges (no labels)
 

@@ -110,6 +110,26 @@ pub enum LlmClientError {
     General(String),
 }
 
+/// Low-cardinality reason that routing replaced a selected target.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutingFallbackReason {
+    /// The request exceeded the selected target's context window.
+    ContextWindow,
+    /// The selected target could not serve an otherwise valid request.
+    Unavailable,
+}
+
+impl RoutingFallbackReason {
+    /// Stable value written to routing logs and native statistics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextWindow => "context_window",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// A decision/trace object produced by an algorithm.
 ///
 /// Carried as a trait object (not a generic parameter) so a stream consumer can
@@ -126,6 +146,10 @@ pub trait Decision: Send + Sync {
     /// Whether this is the final call selected to serve the request.
     fn is_routed_call(&self) -> bool {
         true
+    }
+    /// Why routing replaced an earlier selected target, when it did.
+    fn fallback_reason(&self) -> Option<RoutingFallbackReason> {
+        None
     }
     /// A human-readable explanation of the decision, for logs and traces.
     fn reasoning(&self) -> Option<&str>;

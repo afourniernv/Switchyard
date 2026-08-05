@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use opentelemetry::{KeyValue, global};
-use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, Usage};
+use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, RoutingFallbackReason, Usage};
 
 use crate::SharedRoutingLog;
 use crate::routing_log::RoutingLogContext;
@@ -21,7 +21,11 @@ pub(crate) fn observe(
     started: Instant,
     stats: StatsAccumulator,
     cache_eligible: f64,
-    routing_log: Option<(SharedRoutingLog, RoutingLogContext)>,
+    routing_log: Option<(
+        SharedRoutingLog,
+        RoutingLogContext,
+        Option<RoutingFallbackReason>,
+    )>,
 ) -> Response {
     let Response {
         llm_response,
@@ -43,8 +47,14 @@ pub(crate) fn observe(
                 started,
                 cache_eligible,
             );
-            if let Some((log, context)) = routing_log {
-                log.append(context, &model, tier.as_deref(), &agg.usage);
+            if let Some((log, context, fallback_reason)) = routing_log {
+                log.append(
+                    context,
+                    &model,
+                    tier.as_deref(),
+                    fallback_reason,
+                    &agg.usage,
+                );
             }
             LlmResponse::Agg(agg)
         }
@@ -86,8 +96,8 @@ pub(crate) fn observe(
                     started,
                     cache_eligible,
                 );
-                if let Some((log, context)) = routing_log {
-                    log.append(context, &model, tier.as_deref(), &usage);
+                if let Some((log, context, fallback_reason)) = routing_log {
+                    log.append(context, &model, tier.as_deref(), fallback_reason, &usage);
                 }
             };
             LlmResponse::Stream(Box::pin(wrapped))

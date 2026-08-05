@@ -36,7 +36,9 @@ use libsy::{Algorithm, LibsyError, RunObservation, RunObserver};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use switchyard_protocol::{Context, Decision, LlmClientError, Metadata, Request, Usage};
+use switchyard_protocol::{
+    Context, Decision, LlmClientError, Metadata, Request, RoutingFallbackReason, Usage,
+};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
 use tracing::{Instrument, Level};
@@ -134,9 +136,14 @@ impl SharedRoutingLog {
         context: routing_log::RoutingLogContext,
         model: &str,
         tier: Option<&str>,
+        fallback_reason: Option<RoutingFallbackReason>,
         usage: &Usage,
     ) {
-        if let Err(error) = self.writer.lock().append(context, model, tier, usage) {
+        if let Err(error) = self
+            .writer
+            .lock()
+            .append(context, model, tier, fallback_reason, usage)
+        {
             tracing::warn!(path = %self.path.display(), %error, "routing log append failed");
         }
     }
@@ -647,11 +654,17 @@ async fn handle_llm_request(
         Err(error) => return algorithm_error(error),
     };
 
+    for decision in &trace {
+        if let Some(reason) = decision.fallback_reason() {
+            state.stats.record_routing_fallback(reason);
+        }
+    }
     // Metrics, response body, and routing header all read the same decision, so
     // the model they name can never disagree. An empty trace leaves the body with
     // the id the upstream reported.
     let decision = trace.last();
     let response = if let Some(decision) = decision {
+        let fallback_reason = decision.fallback_reason();
         let cache_eligible = cache_probe
             .as_ref()
             .map(|probe| {
@@ -667,7 +680,10 @@ async fn handle_llm_request(
             started.0,
             state.stats,
             cache_eligible,
-            state.routing_log.zip(routing_log_context),
+            state
+                .routing_log
+                .zip(routing_log_context)
+                .map(|(log, context)| (log, context, fallback_reason)),
         )
     } else {
         response

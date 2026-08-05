@@ -6,7 +6,6 @@
 //! publish [`Decision`]s.
 
 use std::{
-    collections::{HashMap, HashSet},
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -24,9 +23,7 @@ use tracing::Instrument;
 /// [`switchyard_protocol::LlmResponseStreamEvent`] is its host/algorithm envelope; and
 /// [`switchyard_protocol::LlmResponse`] carries either a live
 /// [`switchyard_protocol::LlmResponseStream`] or the terminal aggregate.
-use switchyard_protocol::{
-    Context, Decision, LlmClientError, Request, Response, RoutedLlmClient, Signals, Usage,
-};
+use switchyard_protocol::{Context, Decision, Request, Response, RoutedLlmClient, Signals, Usage};
 
 use super::driver::{DriverRequest, DriverStep, TypeErasedDriver};
 use crate::{DriverError, LibsyError, Result, observability};
@@ -420,121 +417,30 @@ impl LlmTargetSet {
     }
 }
 
-/// Bounds process-local overflow history. Dropping a live session's entry costs one
-/// rediscovered overflow, so the victim choice does not need to be exact.
-const MAX_EVICTION_SESSIONS: usize = 1_024;
+/// Stable identity for request state that must not cross agent boundaries.
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub(crate) enum RoutingIdentity {
+    /// Root-agent traffic shares state within its session.
+    Session(String),
+    /// A child agent owns state independently within the parent session.
+    Subagent { session: String, agent: String },
+}
 
-/// Per-session record of the targets that overflowed their context window.
+/// Derives the request identity used by persistent routing state.
 ///
-/// A conversation only grows, so a target that could not fit one turn will not fit a
-/// later one; remembering it lets the next turn skip a call certain to fail. Requests
-/// without a session id are not tracked — there is nothing to remember them by.
-#[derive(Default)]
-pub(crate) struct SessionEvictions {
-    sessions: Mutex<HashMap<String, HashSet<String>>>,
-}
-
-impl SessionEvictions {
-    /// The targets `session` has already overflowed; empty for an untracked request.
-    fn evicted_in(&self, session: Option<&str>) -> Vec<String> {
-        let Some(session) = session else {
-            return Vec::new();
-        };
-        self.sessions
-            .lock()
-            .get(session)
-            .map(|targets| targets.iter().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    /// Remembers that `target` overflowed in `session`, tracking at most
-    /// [`MAX_EVICTION_SESSIONS`] sessions.
-    fn record(&self, session: Option<&str>, target: &str) {
-        let Some(session) = session else { return };
-        let mut sessions = self.sessions.lock();
-        if sessions.len() >= MAX_EVICTION_SESSIONS
-            && !sessions.contains_key(session)
-            && let Some(oldest) = sessions.keys().next().cloned()
-        {
-            sessions.remove(&oldest);
-        }
-        sessions
-            .entry(session.to_string())
-            .or_default()
-            .insert(target.to_string());
-    }
-}
-
-/// How many of `targets` this request is still allowed to reach.
-fn eligible_targets(targets: &LlmTargetSet, ctx: &Context) -> usize {
-    targets
-        .targets()
-        .iter()
-        .filter(|t| !ctx.is_excluded(&t.semantic_name))
-        .count()
-}
-
-/// Bars the targets `session` has already overflowed from this request, so routing does
-/// not select one that is certain to fail again.
-pub(crate) fn exclude_evicted(
-    ctx: &mut Context,
-    targets: &LlmTargetSet,
-    evictions: &SessionEvictions,
-    session: Option<&str>,
-) {
-    for target in evictions.evicted_in(session) {
-        // Never seed the pool empty: a later turn may be small enough to serve, and the
-        // caller should get the upstream's answer rather than a routing error.
-        if eligible_targets(targets, ctx) <= 1 {
-            break;
-        }
-        ctx.exclude_target(target);
-    }
-}
-
-/// Calls `target`, falling back to the next eligible target in `targets` whenever one
-/// overflows its context window, until a call succeeds or every target has been tried.
-///
-/// Routing is deliberately not re-run: the fallback replaces the target in place, so the
-/// caller's request-side work and retained state still see exactly one turn.
-/// `fallback_decision` builds the [`Decision`] published for a `from -> to` hop, and each
-/// overflow is recorded against `session` so later turns skip that target outright.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_llm_with_overflow_fallback(
-    mut ctx: Context,
-    driver: &Driver,
-    targets: &LlmTargetSet,
-    mut target: LlmTarget,
-    mut decision: Arc<dyn Decision>,
-    request: Request,
-    session: Option<&str>,
-    evictions: &SessionEvictions,
-    fallback_decision: impl Fn(&LlmTarget, &LlmTarget) -> Arc<dyn Decision>,
-) -> Result<Response> {
-    loop {
-        let result = driver
-            .call_llm_target(ctx.clone(), &target, request.clone(), decision.clone())
-            .await;
-        let Err(error) = result else { return result };
-        let LibsyError::ClientCall {
-            target: failed,
-            source: LlmClientError::ContextWindowExceeded { .. },
-        } = &error
-        else {
-            return Err(error);
-        };
-        // A target already excluded means the pool is spent; surface the client error
-        // so the caller still sees a context overflow rather than an internal failure.
-        if !ctx.exclude_target(failed) {
-            return Err(error);
-        }
-        evictions.record(session, failed);
-        let Ok(next) = targets.resolve_target(&target.semantic_name, &ctx) else {
-            return Err(error);
-        };
-        decision = fallback_decision(&target, &next);
-        target = next;
-        driver.info(ctx.clone(), decision.clone()).await?;
+/// A declared child without both identifiers is untracked rather than sharing its
+/// parent's state.
+pub(crate) fn routing_identity(request: &Request) -> Option<RoutingIdentity> {
+    let metadata = request.metadata.as_ref()?;
+    let session = metadata.session_id.as_deref().filter(|id| !id.is_empty())?;
+    if metadata.is_subagent {
+        let agent = metadata.agent_id.as_deref().filter(|id| !id.is_empty())?;
+        Some(RoutingIdentity::Subagent {
+            session: session.to_string(),
+            agent: agent.to_string(),
+        })
+    } else {
+        Some(RoutingIdentity::Session(session.to_string()))
     }
 }
 
@@ -815,7 +721,7 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use switchyard_protocol::{
-        LlmResponse, LlmResponseChunk, completion_text, text_request, text_response,
+        LlmClientError, LlmResponse, LlmResponseChunk, completion_text, text_request, text_response,
     };
 
     #[derive(Debug, thiserror::Error)]
