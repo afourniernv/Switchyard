@@ -8,23 +8,21 @@ deployment through Relay's
 
 ## Upstream Error Compatibility
 
-Relay 0.8.x and 0.9.0 have a native-plugin error propagation issue. Enabling the
-Switchyard plugin can change an upstream 401 or 403 into a generic 400 for a
-non-streaming request. A streaming request can receive HTTP 200 followed by an
-aborted body. This is not a successful response or an authentication bypass.
+Relay versions without the fix in
+[NeMo Relay PR #1109](https://github.com/NVIDIA/NeMo-Relay/pull/1109) have a native-plugin error
+propagation issue. Enabling the Switchyard plugin can change an upstream 401 or 403 into a generic
+400 for a non-streaming request. A streaming request can receive HTTP 200 followed by an aborted
+body. This is not a successful response or an authentication bypass.
 
 This also affects **unmanaged models**: requested model names that do not match
 a configured Switchyard route. For example, if the route is `switchyard/core`
 and its target is `azure/openai/gpt-5.5`, requesting the target name directly
 still delegates the request to Relay.
 
-This is a known issue. A proposed correction is tracked in
-[NeMo Relay PR #1109](https://github.com/NVIDIA/NeMo-Relay/pull/1109).
-The correction has not been released. Until a fix is available, send unmanaged
-traffic through a separate Relay instance with the plugin disabled.
-Do not assume that upgrading Switchyard alone fixes this.
-The plugin's `>=0.8.0, <1.0.0` compatibility range describes which hosts can load
-it; it does not mean those older hosts preserve upstream errors correctly.
+The correction has not been released. Until a fix is available, send unmanaged traffic through a
+separate Relay instance with the plugin disabled. Do not assume that upgrading Switchyard alone
+fixes this. The Relay 0.10 floor is required for nested routing scopes; it does not include this
+separate upstream-error correction.
 
 ## Why Use Switchyard with NeMo Relay?
 
@@ -173,7 +171,7 @@ and how it
 
 !!! note "Relay compatibility"
 
-    The plugin requires `relay = ">=0.8.0, <1.0.0"` and native plugin API `1`.
+    The plugin requires `relay = ">=0.10.0, <1.0.0"` and native plugin API `1`.
     The packaged
     [`relay-plugin.toml`](../../crates/switchyard-nemo-relay-plugin/relay-plugin.toml)
     is the source of truth.

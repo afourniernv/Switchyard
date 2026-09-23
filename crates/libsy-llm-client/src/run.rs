@@ -253,6 +253,7 @@ async fn call_first_available(
         switchyard.algorithm = algorithm,
         switchyard.candidate = index + 1,
         switchyard.candidate_count = count,
+        switchyard.call_phase = if buffer { "routing" } else { "completion" },
         selected_model = %model_id,
         otel.kind = "client",
         otel.name = %format_args!("chat {model_id}"),

@@ -1687,7 +1687,7 @@ async fn failed_call_records_metrics_without_error_details() -> switchyard_libsy
 #[tokio::test]
 async fn classifier_metrics_count_routing_and_answer_calls_once() -> switchyard_libsy::Result<()> {
     let _guard = serialize_test().lock().await;
-    let (_store, exporter, provider, _, _) = telemetry();
+    let (store, exporter, provider, _, _) = telemetry();
     let before = flushed_metrics(exporter, provider);
     let total_requests_before =
         u64_gauge_value(&before, "switchyard.total_requests").unwrap_or_default();
@@ -1701,6 +1701,15 @@ async fn classifier_metrics_count_routing_and_answer_calls_once() -> switchyard_
         run_classifier("classifier", "weak", "strong", client, classifier_request()).await?;
 
     assert_eq!(selected_model, "weak");
+
+    let spans = store.spans();
+    for (model, phase) in [("classifier", "routing"), ("weak", "completion")] {
+        let span = find_span(&spans, "libsy.client_call", "selected_model", model);
+        assert_eq!(
+            span.fields.get("switchyard.call_phase").map(String::as_str),
+            Some(phase)
+        );
+    }
 
     let snapshots = flushed_metrics(exporter, provider);
     assert_eq!(
