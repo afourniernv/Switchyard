@@ -11,7 +11,7 @@ use nemo_relay_plugin::{
     MetricValueType, PluginRuntime,
 };
 use serde_json::{Map, json};
-use switchyard_llm_client::{LlmCallObservation, RunObservation, RunObserver, RunTraceObserver};
+use switchyard_llm_client::{LlmCallObservation, RunObservation, RunObserver};
 use switchyard_protocol::{
     LlmClientError, LlmResponse, LlmResponseChunk, LlmStreamError, Metadata, ProviderExtensions,
     Request, Response, Usage, WireFormat,
@@ -22,7 +22,7 @@ use switchyard_runner::{
 use switchyard_translation::{TranslationEngine, encode_stream_with_extensions};
 
 use crate::config::SwitchyardConfig;
-use crate::relay_trace::RelayTrace;
+use crate::span_capture::{CapturedSpan, capture_client_spans};
 use crate::translation;
 
 #[cfg(test)]
@@ -60,7 +60,7 @@ pub(crate) struct RoutingMetric {
 pub(crate) enum RoutingEvent {
     Mark(RoutingMark),
     Metric(RoutingMetric),
-    Trace(RelayTrace),
+    Span(CapturedSpan),
 }
 
 struct MetricDescriptor<'a> {
@@ -184,7 +184,7 @@ impl SwitchyardRuntime {
                     .iter()
                     .find_map(|event| match event {
                         RoutingEvent::Mark(mark) => Some(mark.metadata.clone()),
-                        RoutingEvent::Metric(_) | RoutingEvent::Trace(_) => None,
+                        RoutingEvent::Metric(_) | RoutingEvent::Span(_) => None,
                     })
                     .unwrap_or_else(|| Json::Object(Map::new()));
                 let result = returned_events(
@@ -266,12 +266,10 @@ impl SwitchyardRuntime {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(observation);
         });
-        let trace_observer: RunTraceObserver = Arc::new(move |trace| {
-            emit_event(RoutingEvent::Trace(trace.into()));
-        });
-        match route
-            .execute_with_trace_observer(request, Some(observer), Some(trace_observer))
-            .await
+        match capture_client_spans(route.execute(request, Some(observer)), move |span| {
+            emit_event(RoutingEvent::Span(span));
+        })
+        .await
         {
             Ok(output) => {
                 let outcome_fields = self.emit_observations(
@@ -497,9 +495,9 @@ pub(crate) fn emit_event(
         RoutingEvent::Metric(metric) => runtime
             .emit_metric(&metric.name, metric.measurements, Some(&metric.metadata))
             .map_err(|error| ("routing metric", metric.name, error)),
-        RoutingEvent::Trace(trace) => trace
+        RoutingEvent::Span(span) => span
             .emit(runtime)
-            .map_err(|error| ("routing trace", "switchyard".into(), error)),
+            .map_err(|error| ("routing span", "libsy".into(), error)),
     };
     if let Err((kind, name, error)) = result {
         let message = redactor.text(format!(
@@ -525,7 +523,7 @@ fn sanitize_event(redactor: &ProviderKeyRedactor, mut event: RoutingEvent) -> Ro
                     .map(|value| redactor.value(value));
             }
         }
-        RoutingEvent::Trace(trace) => trace.sanitize(redactor),
+        RoutingEvent::Span(span) => span.sanitize(redactor),
     }
     event
 }
@@ -695,7 +693,7 @@ fn route_execution_error_events(
 fn event_metadata(events: &[RoutingEvent]) -> Option<Json> {
     events.iter().find_map(|event| match event {
         RoutingEvent::Mark(mark) => Some(mark.metadata.clone()),
-        RoutingEvent::Metric(_) | RoutingEvent::Trace(_) => None,
+        RoutingEvent::Metric(_) | RoutingEvent::Span(_) => None,
     })
 }
 
@@ -1062,9 +1060,7 @@ mod tests {
                     RoutingEvent::Mark(mark) if mark.name == "switchyard.routing.decision" => {
                         Some(&mark.data)
                     }
-                    RoutingEvent::Mark(_) | RoutingEvent::Metric(_) | RoutingEvent::Trace(_) => {
-                        None
-                    }
+                    RoutingEvent::Mark(_) | RoutingEvent::Metric(_) | RoutingEvent::Span(_) => None,
                 })
                 .expect("decision mark should be emitted");
             assert_eq!(decision["selected_model"], "target/model");
@@ -1148,7 +1144,7 @@ mod tests {
                 RoutingEvent::Mark(mark) if mark.name == "switchyard.routing.error" => {
                     Some(&mark.data)
                 }
-                RoutingEvent::Mark(_) | RoutingEvent::Metric(_) | RoutingEvent::Trace(_) => None,
+                RoutingEvent::Mark(_) | RoutingEvent::Metric(_) | RoutingEvent::Span(_) => None,
             })
             .expect("error mark should be emitted");
         assert!(error["outcome_id"].is_string());

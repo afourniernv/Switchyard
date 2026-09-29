@@ -28,12 +28,9 @@ pub mod run;
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};
-pub use observation::{
-    LlmCallObservation, LlmCallPhase, LlmCallTrace, LlmCallTraceOutcome, RunObservation,
-    RunObserver, RunTraceObserver,
-};
+pub use observation::{LlmCallObservation, RunObservation, RunObserver};
 pub use raw::RawResponse;
-pub use run::{ClientRouter, decide, run, run_with_trace_observer};
+pub use run::{ClientRouter, decide, run};
 pub use switchyard_translation::RawEventStream;
 
 /// Registers process-wide compatibility gauges with the global meter provider.

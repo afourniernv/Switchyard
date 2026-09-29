@@ -303,23 +303,29 @@ can receive these records, but each output format presents them differently.
 | Output | What the current integration shows |
 | --- | --- |
 | ATIF | The request and response seen by the agent. Internal routing is not added as separate steps or included in `final_metrics`. Relay-managed ATIF files may retain the raw records under `extra.observed_events`. |
-| OpenTelemetry traces, including OpenInference | Relay's outer LLM span, nested `switchyard.client_call` and `switchyard.upstream_attempt` duration scopes, plus eligible routing marks. |
+| OpenTelemetry traces, including OpenInference | Relay's outer LLM span, nested `libsy.client_call` and `libsy.upstream_attempt` duration scopes, plus eligible routing marks. |
 | OpenTelemetry metrics | Switchyard request, routing-call, latency, token, and failure measurements. Combine the reported routing usage with Relay's answer cost to estimate the observed routed cost. |
 | OTLP logs | Non-metric Switchyard marks that meet the configured severity threshold. |
 
-The plugin reports each completed routing or answer call as a
-`switchyard.client_call` LLM scope. Physical HTTP retries appear beneath that
-call as `switchyard.upstream_attempt` custom scopes. Their timestamps come from
-Switchyard's request lifecycle, so a buffered call ends with its response while
-a streaming call remains open until the stream finishes, errors, or is dropped.
-The projection contains bounded routing metadata only; it does not copy prompts,
-responses, provider error bodies, or credentials into scope metadata.
+The plugin captures two existing Switchyard spans. Each routing or answer call
+becomes a `libsy.client_call` scope. Physical HTTP attempts and retries become
+`libsy.upstream_attempt` child scopes. Buffered calls close with the response;
+streaming calls close when the stream finishes, fails, or is dropped. The
+projection contains bounded routing metadata only and does not copy prompts,
+responses, provider error bodies, or credentials into Relay.
 
-| Switchyard signal | Relay record | Parent | Timestamp and outcome |
+`switchyard.call_phase` records when Switchyard issued a client call:
+`routing` while the algorithm was still deciding, or `completion` after a
+target was selected. A routing-phase response can later become the final
+answer, so this is intentionally different from the `call_role` on
+`switchyard.routing.llm_call` marks, which records the post-outcome
+classification as `routing` or `answer`.
+
+| Switchyard signal | Relay record | Parent | Lifetime |
 | --- | --- | --- | --- |
-| Routing or answer model call | `switchyard.client_call` LLM scope | Relay's managed request scope | Opens when Switchyard starts the call. Buffered calls close on response; streams close on EOF, error, or drop. |
-| Physical provider request or retry | `switchyard.upstream_attempt` custom scope | Its `switchyard.client_call` scope | Opens before the HTTP attempt and closes on response, error, or cancellation. Retry delay is metadata on the failed attempt, not part of its duration. |
-| Routing request, decision, overhead, or failure | Existing `switchyard.routing.*` mark | The active Relay scope at emission | Point-in-time mark using Relay's emission time and the existing mark outcome fields. |
+| Routing or answer model call | `libsy.client_call` scope | Relay's managed request scope | Starts with the Switchyard call and closes with the buffered response or terminal stream event. |
+| Physical provider request or retry | `libsy.upstream_attempt` scope | Its `libsy.client_call` scope | Starts before the HTTP attempt and closes on response, error, or cancellation. |
+| Routing request, decision, overhead, or failure | Existing `switchyard.routing.*` mark | Active Relay scope at emission | Point-in-time mark using the existing outcome fields. |
 
 ### How Routing Appears in Traces
 
@@ -329,8 +335,8 @@ In Relay's
 controls how marks appear. With `inherit` or `event`, a routing mark is an event
 on its parent span while that span is open. Otherwise, Relay emits it as a
 zero-duration span and retains its parent when possible. With `tool`, routing
-marks are always visible zero-duration spans. Routing marks remain separate from
-the nested call and attempt scopes. The
+marks are always visible zero-duration spans. The plugin does not nest these
+marks under the LLM span. The
 [`gen_ai` projection](https://docs.nvidia.com/nemo/relay/configure-plugins/observability/opentelemetry#genai-projection)
 omits marks. With `mark_projection = "tool"`, the trace has this shape:
 
@@ -338,8 +344,8 @@ omits marks. With `mark_projection = "tool"`, the trace has this shape:
 flowchart LR
     agent["Relay agent scope"]
     llm["LLM call"]
-    call["switchyard.client_call<br/>routing or completion"]
-    attempt["switchyard.upstream_attempt<br/>one per HTTP attempt"]
+    call["libsy.client_call<br/>routing or completion"]
+    attempt["libsy.upstream_attempt<br/>one per HTTP attempt"]
     requested["mark:switchyard.routing.requested<br/>zero duration"]
     calls["mark:switchyard.routing.llm_call<br/>zero duration"]
     overhead["mark:switchyard.routing.overhead<br/>zero duration"]

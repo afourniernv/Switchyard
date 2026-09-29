@@ -17,8 +17,7 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value, json};
 use switchyard_protocol::{
     LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
-    ModelId, Request, Response, RoutedLlmClient, UpstreamAttemptObservation,
-    UpstreamAttemptObserver, UpstreamAttemptOutcome,
+    ModelId, Request, Response, RoutedLlmClient,
 };
 use switchyard_translation::{
     TranslationError, WireFormat, decode_aggregated_response, decode_request, decode_stream,
@@ -134,14 +133,6 @@ pub struct TranslatingLlmClient {
     unavailable_until: HashMap<ModelId, AtomicU64>,
 }
 
-#[derive(Clone, Copy)]
-struct SendContext<'a> {
-    metadata: Option<&'a Metadata>,
-    model: &'a ModelId,
-    streaming: bool,
-    attempt_observer: Option<&'a UpstreamAttemptObserver>,
-}
-
 impl TranslatingLlmClient {
     /// Builds a client over the given [`ModelConfig`]s, with a fresh shared HTTP
     /// client and the built-in translation codecs.
@@ -226,11 +217,11 @@ impl TranslatingLlmClient {
         let http_response = self
             .send_encoded(
                 backend,
+                wire_format,
                 llm_request,
                 metadata.as_ref(),
                 model,
                 UpstreamEndpoint::Auxiliary(operation),
-                None,
             )
             .await?;
         let EncodedResponse::Buffered { body, .. } = http_response else {
@@ -257,13 +248,12 @@ impl TranslatingLlmClient {
     async fn send_encoded(
         &self,
         backend: &Backend,
+        wire_format: WireFormat,
         llm_request: LlmRequest,
         metadata: Option<&Metadata>,
         model: &ModelId,
         endpoint: UpstreamEndpoint,
-        attempt_observer: Option<&UpstreamAttemptObserver>,
     ) -> Result<EncodedResponse> {
-        let wire_format = backend.wire_format();
         let cooldown = backend.failure_cooldown();
         let unavailable_until =
             if matches!(endpoint, UpstreamEndpoint::Completion) && !cooldown.is_zero() {
@@ -277,6 +267,7 @@ impl TranslatingLlmClient {
             tracing::debug!(model = %model, wire_format = %wire_format, "skipping backend during failure cooldown");
             return Err(LlmClientError::TemporarilyUnavailable);
         }
+
         let mut body = encode_request(&llm_request, wire_format)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
@@ -309,17 +300,7 @@ impl TranslatingLlmClient {
         record_gen_ai_request(&url, model, streaming);
 
         let result = self
-            .send_with_retries(
-                &url,
-                backend,
-                &body,
-                SendContext {
-                    metadata,
-                    model,
-                    streaming,
-                    attempt_observer,
-                },
-            )
+            .send_with_retries(&url, backend, &body, metadata, model, streaming)
             .await;
         // Forwarded credentials can hit a user's quota while the backend remains healthy.
         if let Some(until) = unavailable_until
@@ -341,7 +322,9 @@ impl TranslatingLlmClient {
         url: &str,
         backend: &Backend,
         body: &Value,
-        context: SendContext<'_>,
+        metadata: Option<&Metadata>,
+        model: &ModelId,
+        streaming: bool,
     ) -> Result<EncodedResponse> {
         let max_retries = u64::from(backend.max_retries());
         let max_attempts = max_retries + 1;
@@ -368,7 +351,7 @@ impl TranslatingLlmClient {
             let span = tracing::debug_span!(
                 target: "libsy",
                 "libsy.upstream_attempt",
-                model = %context.model,
+                model = %model,
                 wire_format = %backend.wire_format(),
                 attempt = attempt + 1,
                 max_attempts,
@@ -379,39 +362,21 @@ impl TranslatingLlmClient {
                 will_retry = tracing::field::Empty,
                 retry_delay_ms = tracing::field::Empty,
             );
-            let mut attempt_trace = None;
+            let mut attempt_started = false;
             let result = tokio::select! {
                 biased;
-                timeout = &mut deadline => Err(timeout),
-                result = async {
-                    attempt_trace = Some(AttemptTraceGuard::new(
-                        context.attempt_observer,
-                        context.model.clone(),
-                        backend.wire_format(),
-                        attempt + 1,
-                        max_attempts,
-                    ));
-                    self.send_once(
-                        url,
-                        backend,
-                        body,
-                        context.metadata,
-                        context.model,
-                        context.streaming,
-                    ).await
-                }.instrument(span.clone()) => Ok(result),
-            };
-            let result = match result {
-                Ok(result) => result,
-                Err(timeout) => {
-                    if let Some(trace) = attempt_trace.take() {
+                timeout = &mut deadline => {
+                    if attempt_started {
                         metrics::record_upstream_attempt(None);
-                        trace.finish(UpstreamAttemptOutcome::Error, None, false, None);
                     }
                     span.record("outcome", "error");
                     span.record("will_retry", false);
                     return Err(deadline_error(timeout));
                 }
+                result = async {
+                    attempt_started = true;
+                    self.send_once(url, backend, body, metadata, model, streaming).await
+                }.instrument(span.clone()) => result,
             };
             // The retained handle updates this same attempt span with its outcome.
             match result {
@@ -419,14 +384,6 @@ impl TranslatingLlmClient {
                     span.record("outcome", "ok");
                     span.record("status_code", response.status());
                     span.record("will_retry", false);
-                    if let Some(trace) = attempt_trace.take() {
-                        trace.finish(
-                            UpstreamAttemptOutcome::Ok,
-                            Some(response.status()),
-                            false,
-                            None,
-                        );
-                    }
                     if attempt > 0 {
                         metrics::record_retry_recovered();
                     }
@@ -451,26 +408,10 @@ impl TranslatingLlmClient {
                     }
                     span.record("will_retry", will_retry);
                     if !will_retry {
-                        if let Some(trace) = attempt_trace.take() {
-                            trace.finish(
-                                UpstreamAttemptOutcome::Error,
-                                failure.status.map(|status| status.as_u16()),
-                                false,
-                                None,
-                            );
-                        }
                         return Err(failure.error);
                     }
 
                     let delay = retry_delay(attempt, failure.retry_after);
-                    if let Some(trace) = attempt_trace.take() {
-                        trace.finish(
-                            UpstreamAttemptOutcome::Error,
-                            failure.status.map(|status| status.as_u16()),
-                            true,
-                            Some(delay),
-                        );
-                    }
                     span.record("retry_delay_ms", duration_millis(delay));
                     // Close the attempt span before sleeping so backoff is not attempt latency.
                     drop(span);
@@ -602,16 +543,6 @@ impl TranslatingLlmClient {
         request: Request,
         model_name: Option<&ModelId>,
     ) -> Result<Response> {
-        self.call_rewrite_model_observed(request, model_name, None)
-            .await
-    }
-
-    async fn call_rewrite_model_observed(
-        &self,
-        request: Request,
-        model_name: Option<&ModelId>,
-        attempt_observer: Option<&UpstreamAttemptObserver>,
-    ) -> Result<Response> {
         let Request {
             mut llm_request,
             metadata,
@@ -644,11 +575,11 @@ impl TranslatingLlmClient {
         let http_response = self
             .send_encoded(
                 backend,
+                wire_format,
                 llm_request,
                 metadata.as_ref(),
                 &model_id,
                 UpstreamEndpoint::Completion,
-                attempt_observer,
             )
             .await?;
 
@@ -772,91 +703,6 @@ impl TranslatingLlmClient {
 impl RoutedLlmClient for TranslatingLlmClient {
     async fn call(&self, request: Request) -> Result<Response> {
         self.call_rewrite_model(request, None).await
-    }
-
-    async fn call_with_attempt_observer(
-        &self,
-        request: Request,
-        observer: &UpstreamAttemptObserver,
-    ) -> Result<Response> {
-        self.call_rewrite_model_observed(request, None, Some(observer))
-            .await
-    }
-}
-
-struct AttemptTraceGuard<'a> {
-    observer: Option<&'a UpstreamAttemptObserver>,
-    model: ModelId,
-    wire_format: WireFormat,
-    attempt: u64,
-    max_attempts: u64,
-    started_at: SystemTime,
-    started: std::time::Instant,
-}
-
-impl<'a> AttemptTraceGuard<'a> {
-    fn new(
-        observer: Option<&'a UpstreamAttemptObserver>,
-        model: ModelId,
-        wire_format: WireFormat,
-        attempt: u64,
-        max_attempts: u64,
-    ) -> Self {
-        Self {
-            observer,
-            model,
-            wire_format,
-            attempt,
-            max_attempts,
-            started_at: SystemTime::now(),
-            started: std::time::Instant::now(),
-        }
-    }
-
-    fn finish(
-        mut self,
-        outcome: UpstreamAttemptOutcome,
-        status_code: Option<u16>,
-        will_retry: bool,
-        retry_delay: Option<Duration>,
-    ) {
-        self.emit(outcome, status_code, will_retry, retry_delay);
-    }
-
-    fn emit(
-        &mut self,
-        outcome: UpstreamAttemptOutcome,
-        status_code: Option<u16>,
-        will_retry: bool,
-        retry_delay: Option<Duration>,
-    ) {
-        let Some(observer) = self.observer.take() else {
-            return;
-        };
-        observer(UpstreamAttemptObservation {
-            model: self.model.clone(),
-            wire_format: self.wire_format,
-            attempt: self.attempt,
-            max_attempts: self.max_attempts,
-            started_at: self.started_at,
-            ended_at: self
-                .started_at
-                .checked_add(self.started.elapsed())
-                .unwrap_or_else(SystemTime::now),
-            outcome,
-            status_code,
-            will_retry,
-            retry_delay,
-        });
-    }
-}
-
-impl Drop for AttemptTraceGuard<'_> {
-    fn drop(&mut self) {
-        // Drop may run during unwinding, so an observer panic must not abort the process.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.emit(UpstreamAttemptOutcome::Cancelled, None, false, None);
-        }));
     }
 }
 
@@ -2558,84 +2404,6 @@ mod tests {
         assert_eq!(completion_text(&agg), "recovered");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn attempt_observer_reports_retry_then_recovery()
-    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
-        let server = MockServer::start().await;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed_calls = Arc::clone(&calls);
-        Mock::given(method("POST"))
-            .respond_with(move |_: &wiremock::Request| {
-                if observed_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    ResponseTemplate::new(503)
-                        .insert_header("retry-after", "0")
-                        .set_body_string("temporarily unavailable")
-                } else {
-                    chat_success_response()
-                }
-            })
-            .mount(&server)
-            .await;
-
-        let client =
-            TranslatingLlmClient::new(&chat_map_with_retries(&format!("{}/v1", server.uri()), 1))?;
-        let attempts = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let observed = Arc::clone(&attempts);
-        let observer = move |attempt| observed.lock().push(attempt);
-        client
-            .call_with_attempt_observer(request_for(Some("gpt"), false), &observer)
-            .await?;
-
-        let attempts = attempts.lock();
-        assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0].attempt, 1);
-        assert_eq!(attempts[0].outcome, UpstreamAttemptOutcome::Error);
-        assert_eq!(attempts[0].status_code, Some(503));
-        assert!(attempts[0].will_retry);
-        assert_eq!(attempts[0].retry_delay, Some(Duration::ZERO));
-        assert_eq!(attempts[1].attempt, 2);
-        assert_eq!(attempts[1].outcome, UpstreamAttemptOutcome::Ok);
-        assert_eq!(attempts[1].status_code, Some(200));
-        assert!(!attempts[1].will_retry);
-        assert!(
-            attempts
-                .iter()
-                .all(|attempt| attempt.started_at <= attempt.ended_at)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn dropping_an_in_flight_attempt_reports_cancellation() {
-        let attempts = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let observed = Arc::clone(&attempts);
-        let observer = move |attempt| observed.lock().push(attempt);
-        drop(AttemptTraceGuard::new(
-            Some(&observer),
-            ModelId::from("gpt"),
-            WireFormat::OpenAiChat,
-            1,
-            2,
-        ));
-
-        let attempts = attempts.lock();
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].outcome, UpstreamAttemptOutcome::Cancelled);
-        assert!(!attempts[0].will_retry);
-    }
-
-    #[test]
-    fn dropping_an_attempt_contains_observer_panics() {
-        let observer = |_attempt| panic!("observer failed");
-        drop(AttemptTraceGuard::new(
-            Some(&observer),
-            ModelId::from("gpt"),
-            WireFormat::OpenAiChat,
-            1,
-            1,
-        ));
     }
 
     #[tokio::test]

@@ -228,10 +228,11 @@ marks. Call marks distinguish routing from answer calls; decisions distinguish
 selected from served models. Token metrics cover both call roles, while Relay
 retains ownership of the outer LLM lifecycle.
 
-The plugin also emits payload-free `switchyard.client_call` LLM scopes with
-`switchyard.upstream_attempt` child scopes. These preserve routing, fallback,
-retry, failure, and streaming-cancellation timing beneath Relay's outer request
-without installing or replacing the application's tracing subscriber.
+The plugin also captures the existing `libsy.client_call` and
+`libsy.upstream_attempt` spans for each routed request. It replays completed
+spans beneath Relay's outer LLM scope with their original timestamps. The
+projection includes bounded routing metadata only; it excludes prompts,
+responses, provider error bodies, and credentials.
 
 ## Observability
 

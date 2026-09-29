@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 use libsy::{Algorithm, LibsyError, RoutingOutcome, RuntimeModels};
 use serde_json::Value;
-use switchyard_llm_client::{
-    AuxiliaryOperation, ClientRouter, RunObserver, RunTraceObserver, TranslatingLlmClient,
-};
+use switchyard_llm_client::{AuxiliaryOperation, ClientRouter, RunObserver, TranslatingLlmClient};
 use switchyard_protocol::{LlmClientError, ModelId, Request, Response, WireFormat};
 use thiserror::Error;
 
@@ -197,24 +195,12 @@ impl Route {
         request: Request,
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
-        self.execute_with_trace_observer(request, observer, None)
-            .await
-    }
-
-    /// Executes the route and reports payload-free internal call traces.
-    pub async fn execute_with_trace_observer(
-        &self,
-        request: Request,
-        observer: Option<RunObserver>,
-        trace_observer: Option<RunTraceObserver>,
-    ) -> Result<RunOutput, RunnerError> {
-        let (selected_model, response) = switchyard_llm_client::run_with_trace_observer(
+        let (selected_model, response) = switchyard_llm_client::run(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
             request,
             Arc::clone(&self.models),
             observer,
-            trace_observer,
         )
         .await?;
         Ok(RunOutput {

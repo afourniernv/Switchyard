@@ -166,7 +166,7 @@ async fn reflected_response(format: WireFormat, streaming: bool, fail: bool) {
     assert!(
         captured
             .iter()
-            .any(|event| matches!(event, RoutingEvent::Trace(_))),
+            .any(|event| matches!(event, RoutingEvent::Span(_))),
         "client span was not emitted"
     );
     let telemetry = format!("{captured:?}");

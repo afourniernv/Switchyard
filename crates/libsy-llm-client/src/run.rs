@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use futures::{StreamExt, TryStreamExt, stream};
 use http::StatusCode;
@@ -32,14 +32,11 @@ use switchyard_libsy::{
 use switchyard_protocol::{
     AggLlmResponse, LlmClientError, LlmResponse, LlmResponseChunk, LlmResponseStream, Message,
     ModelId, Request, Response, ResponseAccumulator, RoutedLlmClient, RoutingFallbackReason,
-    UpstreamAttemptObserver, WireFormat,
+    WireFormat,
 };
 use switchyard_translation::prepare_request_for_target;
 
-use crate::observation::{
-    LlmCallObservation, LlmCallPhase, LlmCallTrace, LlmCallTraceOutcome, RunObservation,
-    RunObserver, RunTraceObserver,
-};
+use crate::observation::{LlmCallObservation, RunObservation, RunObserver};
 use crate::{metrics, observability};
 
 /// Run one request to completion, serving every offloaded model call with `client`.
@@ -62,22 +59,6 @@ pub async fn run(
     models: Arc<RuntimeModels>,
     observer: Option<RunObserver>,
 ) -> Result<(ModelId, Response)> {
-    run_with_trace_observer(algorithm, clients, request, models, observer, None).await
-}
-
-/// Run one request and report payload-free call and attempt traces as they finish.
-///
-/// This integration hook leaves the existing [`run`] API and observations
-/// unchanged. A returned streaming call is reported only when it finishes,
-/// errors, or is dropped.
-pub async fn run_with_trace_observer(
-    algorithm: Arc<dyn Algorithm>,
-    clients: ClientRouter,
-    request: Request,
-    models: Arc<RuntimeModels>,
-    observer: Option<RunObserver>,
-    trace_observer: Option<RunTraceObserver>,
-) -> Result<(ModelId, Response)> {
     let algorithm_name = algorithm.name().to_string();
     let run_started = Instant::now();
     let routing_clients = clients.clone();
@@ -89,15 +70,7 @@ pub async fn run_with_trace_observer(
         None => {
             drive(algorithm, request, models, {
                 let routing_observations = routing_observations.clone();
-                let trace_observer = trace_observer.clone();
-                move |call| {
-                    serve(
-                        routing_clients.clone(),
-                        call,
-                        routing_observations.clone(),
-                        trace_observer.clone(),
-                    )
-                }
+                move |call| serve(routing_clients.clone(), call, routing_observations.clone())
             })
             .await
         }
@@ -139,7 +112,6 @@ pub async fn run_with_trace_observer(
             &outcome.request,
             &outcome.selected_model_ids,
             &observe,
-            trace_observer.as_ref(),
         )
         .await
         .and_then(|response| clients.remember_state_owner(&outcome.request, response))
@@ -165,7 +137,7 @@ pub async fn decide(
         Some(owner) => continue_on(owner, algorithm.name(), request),
         None => {
             drive(algorithm, request, models, move |call| {
-                serve(routing_clients.clone(), call, None, None)
+                serve(routing_clients.clone(), call, None)
             })
             .await?
         }
@@ -206,7 +178,6 @@ async fn serve(
     clients: ClientRouter,
     call: CallModel,
     observations: Option<Arc<Mutex<Vec<LlmCallObservation>>>>,
-    trace_observer: Option<RunTraceObserver>,
 ) -> Result<()> {
     let observe = |observation| {
         if let Some(observations) = &observations {
@@ -223,8 +194,7 @@ async fn serve(
         &observe,
         0,
         call.models.len(),
-        true,
-        trace_observer.as_ref(),
+        CallPhase::Routing,
     )
     .await
     {
@@ -241,7 +211,6 @@ async fn call_first_available(
     request: &Request,
     models: &[ModelId],
     observe: &(dyn Fn(LlmCallObservation) + Send + Sync),
-    trace_observer: Option<&RunTraceObserver>,
 ) -> Result<Response> {
     for (index, target) in models.iter().enumerate() {
         let request = clients.prepare_completion_request(request.clone(), target);
@@ -253,8 +222,7 @@ async fn call_first_available(
             observe,
             index,
             models.len(),
-            false,
-            trace_observer,
+            CallPhase::Completion,
         )
         .await
         {
@@ -274,100 +242,30 @@ async fn call_first_available(
     Err(LibsyError::NoTargets)
 }
 
-struct CallTraceGuard {
-    state: Option<CallTraceState>,
-    attempts: Option<Arc<Mutex<Vec<switchyard_protocol::UpstreamAttemptObservation>>>>,
+/// The stage of the Switchyard run in which a model call was issued.
+///
+/// A routing-phase call may still supply the final answer. This is deliberately
+/// distinct from the `routing`/`answer` role assigned after the outcome is known.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallPhase {
+    Routing,
+    Completion,
 }
 
-struct CallTraceState {
-    observer: RunTraceObserver,
-    algorithm: String,
-    phase: LlmCallPhase,
-    candidate: usize,
-    candidate_count: usize,
-    selected_model: ModelId,
-    started_at: SystemTime,
-    started: Instant,
-    attempts: Arc<Mutex<Vec<switchyard_protocol::UpstreamAttemptObservation>>>,
-}
-
-impl CallTraceGuard {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        observer: Option<RunTraceObserver>,
-        algorithm: &str,
-        phase: LlmCallPhase,
-        candidate: usize,
-        candidate_count: usize,
-        selected_model: ModelId,
-    ) -> Self {
-        let (state, attempts) = match observer {
-            Some(observer) => {
-                let attempts = Arc::new(Mutex::new(Vec::new()));
-                let state = CallTraceState {
-                    observer,
-                    algorithm: algorithm.to_owned(),
-                    phase,
-                    candidate,
-                    candidate_count,
-                    selected_model,
-                    started_at: SystemTime::now(),
-                    started: Instant::now(),
-                    attempts: Arc::clone(&attempts),
-                };
-                (Some(state), Some(attempts))
-            }
-            None => (None, None),
-        };
-        Self { state, attempts }
-    }
-
-    fn attempt_collector(
-        &self,
-    ) -> Option<Arc<Mutex<Vec<switchyard_protocol::UpstreamAttemptObservation>>>> {
-        self.attempts.clone()
-    }
-
-    fn completion(&mut self) -> Option<Box<dyn FnOnce(LlmCallTraceOutcome) + Send + 'static>> {
-        self.state.take().map(|state| {
-            Box::new(move |outcome| state.finish(outcome))
-                as Box<dyn FnOnce(LlmCallTraceOutcome) + Send>
-        })
-    }
-}
-
-impl Drop for CallTraceGuard {
-    fn drop(&mut self) {
-        if let Some(state) = self.state.take() {
-            // Drop may run during unwinding, so an observer panic must not abort the process.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                state.finish(LlmCallTraceOutcome::Cancelled);
-            }));
+impl CallPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Routing => "routing",
+            Self::Completion => "completion",
         }
     }
-}
 
-impl CallTraceState {
-    fn finish(self, outcome: LlmCallTraceOutcome) {
-        let duration = self.started.elapsed();
-        let attempts = {
-            let mut attempts = self.attempts.lock();
-            std::mem::take(&mut *attempts)
-        };
-        (self.observer)(LlmCallTrace {
-            algorithm: self.algorithm,
-            phase: self.phase,
-            candidate: self.candidate,
-            candidate_count: self.candidate_count,
-            selected_model: self.selected_model,
-            started_at: self.started_at,
-            ended_at: self
-                .started_at
-                .checked_add(duration)
-                .unwrap_or_else(SystemTime::now),
-            outcome,
-            attempts,
-        });
+    const fn buffers_stream(self) -> bool {
+        matches!(self, Self::Routing)
+    }
+
+    const fn records_routed_request(self) -> bool {
+        matches!(self, Self::Completion)
     }
 }
 
@@ -382,7 +280,7 @@ impl CallTraceState {
         switchyard.algorithm = algorithm,
         switchyard.candidate = index + 1,
         switchyard.candidate_count = count,
-        switchyard.call_phase = if buffer { "routing" } else { "completion" },
+        switchyard.call_phase = phase.as_str(),
         selected_model = %model_id,
         otel.kind = "client",
         otel.name = %format_args!("chat {model_id}"),
@@ -422,8 +320,7 @@ async fn call_one(
     index: usize,
     // count is for span log
     count: usize,
-    buffer: bool,
-    trace_observer: Option<&RunTraceObserver>,
+    phase: CallPhase,
 ) -> Result<Response> {
     let span = tracing::Span::current();
     observability::record_gen_ai_request(&span, &request.llm_request);
@@ -436,36 +333,13 @@ async fn call_one(
     }
     // Resolved before the clock starts: picking the client is Switchyard's work, not
     // the provider's, so it belongs in the routing overhead.
-    let mut trace = CallTraceGuard::new(
-        trace_observer.cloned(),
-        algorithm,
-        if buffer {
-            LlmCallPhase::Routing
-        } else {
-            LlmCallPhase::Completion
-        },
-        index + 1,
-        count,
-        model_id.clone(),
-    );
-    let attempt_collector = trace.attempt_collector();
-    let attempt_observer = move |attempt| {
-        if let Some(attempts) = &attempt_collector {
-            attempts.lock().push(attempt);
-        }
-    };
     let client = clients.route(model_id);
     let started = Instant::now();
     let result = async {
-        let client = client?;
-        let mut response = if trace_observer.is_some() {
-            client
-                .call_with_attempt_observer(request, &attempt_observer as &UpstreamAttemptObserver)
-                .await?
-        } else {
-            client.call(request).await?
-        };
-        if buffer && let LlmResponse::Stream(chunks) = response.llm_response {
+        let mut response = client?.call(request).await?;
+        if phase.buffers_stream()
+            && let LlmResponse::Stream(chunks) = response.llm_response
+        {
             response.llm_response = LlmResponse::Stream(buffer_routing_stream(chunks).await?);
         }
         Ok(response)
@@ -478,9 +352,8 @@ async fn call_one(
         response.set_served_model(model_id);
         response
     });
-    let trace_completion = trace.completion();
-    let result = observability::observe_client_call_with_trace(result, trace_completion);
-    let result = if !buffer {
+    let result = observability::observe_client_call(result);
+    let result = if phase.records_routed_request() {
         metrics::observe_routed_request(algorithm, model_id, Some(duration), result)
     } else {
         result
