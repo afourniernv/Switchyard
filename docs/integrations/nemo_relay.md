@@ -303,17 +303,23 @@ can receive these records, but each output format presents them differently.
 | Output | What the current integration shows |
 | --- | --- |
 | ATIF | The request and response seen by the agent. Internal routing is not added as separate steps or included in `final_metrics`. Relay-managed ATIF files may retain the raw records under `extra.observed_events`. |
-| OpenTelemetry traces, including OpenInference | Relay's LLM span plus eligible routing marks, depending on the projection. Marks are point-in-time records, not duration spans. |
+| OpenTelemetry traces, including OpenInference | Relay's outer LLM span, nested `switchyard.client_call` and `switchyard.upstream_attempt` duration scopes, plus eligible routing marks. |
 | OpenTelemetry metrics | Switchyard request, routing-call, latency, token, and failure measurements. Combine the reported routing usage with Relay's answer cost to estimate the observed routed cost. |
 | OTLP logs | Non-metric Switchyard marks that meet the configured severity threshold. |
 
-Switchyard creates `libsy.run`, `libsy.llm_call`, `libsy.client_call`, and
-`libsy.upstream_attempt` spans internally. Together they cover the algorithm
-run, model calls requested by the algorithm, candidate attempts including
-fallbacks, and individual HTTP attempts. They are not one connected hierarchy
-today, and the plugin does not send them to Relay. As a result, Relay traces do
-not show those internal operations as nested duration spans or give an internal
-stream its own cancellation lifecycle.
+The plugin reports each completed routing or answer call as a
+`switchyard.client_call` LLM scope. Physical HTTP retries appear beneath that
+call as `switchyard.upstream_attempt` custom scopes. Their timestamps come from
+Switchyard's request lifecycle, so a buffered call ends with its response while
+a streaming call remains open until the stream finishes, errors, or is dropped.
+The projection contains bounded routing metadata only; it does not copy prompts,
+responses, provider error bodies, or credentials into scope metadata.
+
+| Switchyard signal | Relay record | Parent | Timestamp and outcome |
+| --- | --- | --- | --- |
+| Routing or answer model call | `switchyard.client_call` LLM scope | Relay's managed request scope | Opens when Switchyard starts the call. Buffered calls close on response; streams close on EOF, error, or drop. |
+| Physical provider request or retry | `switchyard.upstream_attempt` custom scope | Its `switchyard.client_call` scope | Opens before the HTTP attempt and closes on response, error, or cancellation. Retry delay is metadata on the failed attempt, not part of its duration. |
+| Routing request, decision, overhead, or failure | Existing `switchyard.routing.*` mark | The active Relay scope at emission | Point-in-time mark using Relay's emission time and the existing mark outcome fields. |
 
 ### How Routing Appears in Traces
 
@@ -323,8 +329,8 @@ In Relay's
 controls how marks appear. With `inherit` or `event`, a routing mark is an event
 on its parent span while that span is open. Otherwise, Relay emits it as a
 zero-duration span and retains its parent when possible. With `tool`, routing
-marks are always visible zero-duration spans. The plugin does not nest these
-marks under the LLM span. The
+marks are always visible zero-duration spans. Routing marks remain separate from
+the nested call and attempt scopes. The
 [`gen_ai` projection](https://docs.nvidia.com/nemo/relay/configure-plugins/observability/opentelemetry#genai-projection)
 omits marks. With `mark_projection = "tool"`, the trace has this shape:
 
@@ -332,12 +338,16 @@ omits marks. With `mark_projection = "tool"`, the trace has this shape:
 flowchart LR
     agent["Relay agent scope"]
     llm["LLM call"]
+    call["switchyard.client_call<br/>routing or completion"]
+    attempt["switchyard.upstream_attempt<br/>one per HTTP attempt"]
     requested["mark:switchyard.routing.requested<br/>zero duration"]
     calls["mark:switchyard.routing.llm_call<br/>zero duration"]
     overhead["mark:switchyard.routing.overhead<br/>zero duration"]
     decision["mark:switchyard.routing.decision<br/>zero duration"]
     error["mark:switchyard.routing.error<br/>zero duration"]
     agent --> llm
+    llm --> call
+    call --> attempt
     agent --> requested
     agent --> calls
     agent --> overhead

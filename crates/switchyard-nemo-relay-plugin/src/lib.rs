@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod config;
+mod relay_trace;
 mod runtime;
-mod span_capture;
 mod translation;
 
 use std::sync::Arc;

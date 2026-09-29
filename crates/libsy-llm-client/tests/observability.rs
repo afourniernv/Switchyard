@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -38,11 +38,15 @@ use switchyard_libsy::{
     EscalationJudgeConfig, LibsyError, LlmClassifierConfig, LlmTaskClassifier, PickerMode,
     RoutingOutcome, RuntimeModels, StageRouter, StageRouterConfig, Step, TaskClassifierConfig,
 };
-use switchyard_llm_client::{ClientRouter, RunObservation, RunObserver};
+use switchyard_llm_client::{
+    ClientRouter, LlmCallPhase, LlmCallTrace, LlmCallTraceOutcome, RunObservation, RunObserver,
+    RunTraceObserver,
+};
 use switchyard_protocol::{Category, ModelId};
 use switchyard_protocol::{
     ContentBlock, LlmRequest, LlmResponse, Message, Metadata, Request, Response, Role,
-    RoutedLlmClient, ToolCall, ToolResult, Usage, WireFormat,
+    RoutedLlmClient, ToolCall, ToolResult, UpstreamAttemptObservation, UpstreamAttemptObserver,
+    UpstreamAttemptOutcome, Usage, WireFormat,
 };
 use switchyard_protocol::{
     LlmClientError, LlmResponseChunk, LlmResponseStreamEvent, StopReason, text_request,
@@ -1407,6 +1411,295 @@ impl RoutedLlmClient for StreamingUsageClient {
             upstream_headers: http::HeaderMap::new(),
         })
     }
+}
+
+fn trace_collector() -> (Arc<Mutex<Vec<LlmCallTrace>>>, RunTraceObserver) {
+    let traces = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&traces);
+    let observer: RunTraceObserver = Arc::new(move |trace| observed.lock().push(trace));
+    (traces, observer)
+}
+
+struct AttemptReportingClient;
+
+#[async_trait]
+impl RoutedLlmClient for AttemptReportingClient {
+    async fn call(&self, request: Request) -> Result<Response, LlmClientError> {
+        Ok(Response {
+            llm_response: LlmResponse::Agg(text_response(
+                request.model_id().map(|model| model.to_string()),
+                "observed response",
+            )),
+            metadata: None,
+            upstream_headers: http::HeaderMap::new(),
+        })
+    }
+
+    async fn call_with_attempt_observer(
+        &self,
+        request: Request,
+        observer: &UpstreamAttemptObserver,
+    ) -> Result<Response, LlmClientError> {
+        let model = request.model_id().unwrap_or_default();
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        observer(UpstreamAttemptObservation {
+            model: model.clone(),
+            wire_format: WireFormat::OpenAiChat,
+            attempt: 1,
+            max_attempts: 2,
+            started_at,
+            ended_at: started_at + Duration::from_millis(5),
+            outcome: UpstreamAttemptOutcome::Error,
+            status_code: Some(503),
+            will_retry: true,
+            retry_delay: Some(Duration::from_millis(10)),
+        });
+        observer(UpstreamAttemptObservation {
+            model,
+            wire_format: WireFormat::OpenAiChat,
+            attempt: 2,
+            max_attempts: 2,
+            started_at: started_at + Duration::from_millis(15),
+            ended_at: started_at + Duration::from_millis(20),
+            outcome: UpstreamAttemptOutcome::Ok,
+            status_code: Some(200),
+            will_retry: false,
+            retry_delay: None,
+        });
+        self.call(request).await
+    }
+}
+
+#[tokio::test]
+async fn trace_observer_collects_physical_attempts_in_order() -> switchyard_libsy::Result<()> {
+    let _guard = serialize_test().lock().await;
+    let (traces, observer) = trace_collector();
+
+    switchyard_llm_client::run_with_trace_observer(
+        algo("trace-attempt-algo", "trace-attempt-model"),
+        ClientRouter::single(Arc::new(AttemptReportingClient)),
+        request_with_metadata("trace-attempt-session", "trace-attempt-correlation"),
+        Arc::new(RuntimeModels::default()),
+        None,
+        Some(observer),
+    )
+    .await?;
+
+    let traces = traces.lock();
+    assert_eq!(traces.len(), 1);
+    let attempts = &traces[0].attempts;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].attempt, 1);
+    assert_eq!(attempts[0].outcome, UpstreamAttemptOutcome::Error);
+    assert!(attempts[0].will_retry);
+    assert_eq!(attempts[1].attempt, 2);
+    assert_eq!(attempts[1].outcome, UpstreamAttemptOutcome::Ok);
+    assert!(!attempts[1].will_retry);
+    Ok(())
+}
+
+#[tokio::test]
+async fn trace_observer_reports_completed_buffered_call() -> switchyard_libsy::Result<()> {
+    let _guard = serialize_test().lock().await;
+    let (traces, observer) = trace_collector();
+    const ALGO: &str = "trace-buffered-algo";
+    const MODEL: &str = "trace-buffered-model";
+    let client = Arc::new(UsageClient {
+        usage: Usage::default(),
+    }) as Arc<dyn RoutedLlmClient>;
+
+    switchyard_llm_client::run_with_trace_observer(
+        algo(ALGO, MODEL),
+        ClientRouter::single(client),
+        request_with_metadata("trace-buffered-session", "trace-buffered-correlation"),
+        Arc::new(RuntimeModels::default()),
+        None,
+        Some(observer),
+    )
+    .await?;
+
+    let traces = traces.lock();
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].algorithm, ALGO);
+    assert_eq!(traces[0].phase, LlmCallPhase::Completion);
+    assert_eq!(traces[0].candidate, 1);
+    assert_eq!(traces[0].candidate_count, 1);
+    assert_eq!(traces[0].selected_model, MODEL);
+    assert_eq!(traces[0].outcome, LlmCallTraceOutcome::Ok);
+    assert!(traces[0].started_at <= traces[0].ended_at);
+    Ok(())
+}
+
+#[tokio::test]
+async fn trace_observer_defers_stream_outcome_until_drain_or_drop() -> switchyard_libsy::Result<()>
+{
+    let _guard = serialize_test().lock().await;
+    const ALGO: &str = "trace-stream-algo";
+    const MODEL: &str = "trace-stream-model";
+
+    let (dropped_traces, dropped_observer) = trace_collector();
+    let mut request = request_with_metadata("trace-drop-session", "trace-drop-correlation");
+    request.llm_request.stream = true;
+    let (_, response) = switchyard_llm_client::run_with_trace_observer(
+        algo(ALGO, MODEL),
+        ClientRouter::single(Arc::new(StreamingUsageClient)),
+        request,
+        Arc::new(RuntimeModels::default()),
+        None,
+        Some(dropped_observer),
+    )
+    .await?;
+    assert!(dropped_traces.lock().is_empty());
+    let LlmResponse::Stream(stream) = response.llm_response else {
+        return Err(test_error("expected a streamed response"));
+    };
+    drop(stream);
+    assert_eq!(
+        dropped_traces.lock()[0].outcome,
+        LlmCallTraceOutcome::Cancelled
+    );
+
+    let (drained_traces, drained_observer) = trace_collector();
+    let mut request = request_with_metadata("trace-drain-session", "trace-drain-correlation");
+    request.llm_request.stream = true;
+    let (_, response) = switchyard_llm_client::run_with_trace_observer(
+        algo(ALGO, MODEL),
+        ClientRouter::single(Arc::new(StreamingUsageClient)),
+        request,
+        Arc::new(RuntimeModels::default()),
+        None,
+        Some(drained_observer),
+    )
+    .await?;
+    let LlmResponse::Stream(mut stream) = response.llm_response else {
+        return Err(test_error("expected a streamed response"));
+    };
+    while let Some(event) = stream.next().await {
+        event.expect("valid stream event");
+    }
+    assert_eq!(drained_traces.lock()[0].outcome, LlmCallTraceOutcome::Ok);
+    Ok(())
+}
+
+struct LateErrorStreamingClient;
+
+#[async_trait]
+impl RoutedLlmClient for LateErrorStreamingClient {
+    async fn call(&self, _request: Request) -> Result<Response, LlmClientError> {
+        let stream = futures::stream::iter([
+            Ok(LlmResponseStreamEvent::new(vec![
+                LlmResponseChunk::MessageStop { reason: None },
+            ])),
+            Err(LlmClientError::Transport {
+                source: Box::new(TestError("late stream failure")),
+            }),
+        ]);
+        Ok(Response {
+            llm_response: LlmResponse::Stream(Box::pin(stream)),
+            metadata: None,
+            upstream_headers: http::HeaderMap::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn trace_observer_late_stream_error_overrides_message_stop() -> switchyard_libsy::Result<()> {
+    let _guard = serialize_test().lock().await;
+    let (traces, observer) = trace_collector();
+    let mut request = request_with_metadata("trace-error-session", "trace-error-correlation");
+    request.llm_request.stream = true;
+    let (_, response) = switchyard_llm_client::run_with_trace_observer(
+        algo("trace-error-algo", "trace-error-model"),
+        ClientRouter::single(Arc::new(LateErrorStreamingClient)),
+        request,
+        Arc::new(RuntimeModels::default()),
+        None,
+        Some(observer),
+    )
+    .await?;
+    let LlmResponse::Stream(mut stream) = response.llm_response else {
+        return Err(test_error("expected a streamed response"));
+    };
+    assert!(stream.next().await.is_some_and(|event| event.is_ok()));
+    assert!(stream.next().await.is_some_and(|event| event.is_err()));
+
+    assert_eq!(
+        traces.lock()[0].outcome,
+        LlmCallTraceOutcome::Error {
+            error_type: "transport".into(),
+        }
+    );
+    Ok(())
+}
+
+struct PendingClient;
+
+#[async_trait]
+impl RoutedLlmClient for PendingClient {
+    async fn call(&self, _request: Request) -> Result<Response, LlmClientError> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn trace_observer_reports_cancellation_before_response_headers() {
+    let _guard = serialize_test().lock().await;
+    let (traces, observer) = trace_collector();
+    let result = tokio::time::timeout(
+        Duration::from_millis(10),
+        switchyard_llm_client::run_with_trace_observer(
+            algo("trace-pending-algo", "trace-pending-model"),
+            ClientRouter::single(Arc::new(PendingClient)),
+            request_with_metadata("trace-pending-session", "trace-pending-correlation"),
+            Arc::new(RuntimeModels::default()),
+            None,
+            Some(observer),
+        ),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(traces.lock().len(), 1);
+    assert_eq!(traces.lock()[0].outcome, LlmCallTraceOutcome::Cancelled);
+}
+
+#[tokio::test]
+async fn trace_cancellation_contains_observer_panics() {
+    let _guard = serialize_test().lock().await;
+    let observer: RunTraceObserver = Arc::new(|_| panic!("observer failed"));
+    let result = tokio::time::timeout(
+        Duration::from_millis(10),
+        switchyard_llm_client::run_with_trace_observer(
+            algo("trace-panic-algo", "trace-panic-model"),
+            ClientRouter::single(Arc::new(PendingClient)),
+            request_with_metadata("trace-panic-session", "trace-panic-correlation"),
+            Arc::new(RuntimeModels::default()),
+            None,
+            Some(observer),
+        ),
+    )
+    .await;
+    assert!(result.is_err());
+
+    let observer: RunTraceObserver = Arc::new(|_| panic!("observer failed"));
+    let mut request = request_with_metadata(
+        "trace-panic-stream-session",
+        "trace-panic-stream-correlation",
+    );
+    request.llm_request.stream = true;
+    let (_, response) = switchyard_llm_client::run_with_trace_observer(
+        algo("trace-panic-stream-algo", "trace-panic-stream-model"),
+        ClientRouter::single(Arc::new(StreamingUsageClient)),
+        request,
+        Arc::new(RuntimeModels::default()),
+        None,
+        Some(observer),
+    )
+    .await
+    .expect("stream should open");
+    let LlmResponse::Stream(stream) = response.llm_response else {
+        panic!("expected a streamed response");
+    };
+    drop(stream);
 }
 
 struct TimeoutClient;

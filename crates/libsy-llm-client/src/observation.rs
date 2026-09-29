@@ -4,10 +4,59 @@
 //! Request-scoped observations emitted while serving an algorithm run.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use switchyard_libsy::OutcomeMetadata;
-use switchyard_protocol::{ModelId, Usage};
+use switchyard_protocol::{ModelId, UpstreamAttemptObservation, Usage};
+
+/// Role of a model call within one Switchyard route execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LlmCallPhase {
+    /// A call made by the routing algorithm.
+    Routing,
+    /// A call made to produce the final answer.
+    Completion,
+}
+
+/// Terminal outcome of a completed model call trace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LlmCallTraceOutcome {
+    /// The call completed successfully.
+    Ok,
+    /// The call failed with a bounded error classification.
+    Error {
+        /// Stable error classification without provider response content.
+        error_type: String,
+    },
+    /// The caller abandoned an open response stream.
+    Cancelled,
+}
+
+/// Completed payload-free trace for one Switchyard model call and its attempts.
+#[derive(Clone, Debug)]
+pub struct LlmCallTrace {
+    /// Routing algorithm that initiated the call.
+    pub algorithm: String,
+    /// Whether the call served routing or final completion work.
+    pub phase: LlmCallPhase,
+    /// One-based candidate position for ordered completion fallback.
+    pub candidate: usize,
+    /// Total candidates available to this call site.
+    pub candidate_count: usize,
+    /// Model selected for the call.
+    pub selected_model: ModelId,
+    /// Wall-clock start time paired with a monotonic duration.
+    pub started_at: SystemTime,
+    /// Derived wall-clock end time.
+    pub ended_at: SystemTime,
+    /// Terminal call outcome.
+    pub outcome: LlmCallTraceOutcome,
+    /// Physical upstream attempts completed beneath this call.
+    pub attempts: Vec<UpstreamAttemptObservation>,
+}
+
+/// Request-scoped callback for completed model call traces.
+pub type RunTraceObserver = Arc<dyn Fn(LlmCallTrace) + Send + Sync>;
 
 /// One completed model call observed while serving an algorithm run.
 #[derive(Clone, Debug)]

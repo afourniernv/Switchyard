@@ -8,10 +8,51 @@
 //! libsy's orchestration crate — so a client crate that depends only on the protocol
 //! can serve routed calls without pulling in the orchestrator.
 
+use std::time::{Duration, SystemTime};
+
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::{ModelId, Request, Response};
+use crate::{ModelId, Request, Response, WireFormat};
+
+/// Terminal outcome of one physical upstream request attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamAttemptOutcome {
+    /// The upstream accepted the request and returned a usable response.
+    Ok,
+    /// The attempt failed before a usable response was returned.
+    Error,
+    /// The caller cancelled the request while the attempt was in flight.
+    Cancelled,
+}
+
+/// Bounded, payload-free telemetry for one physical upstream request attempt.
+#[derive(Clone, Debug)]
+pub struct UpstreamAttemptObservation {
+    /// Target model selected for the request.
+    pub model: ModelId,
+    /// Provider wire format used for the request.
+    pub wire_format: WireFormat,
+    /// One-based attempt number.
+    pub attempt: u64,
+    /// Maximum attempts allowed by the backend retry policy.
+    pub max_attempts: u64,
+    /// Wall-clock start time paired with a monotonic duration.
+    pub started_at: SystemTime,
+    /// Derived wall-clock end time.
+    pub ended_at: SystemTime,
+    /// Terminal attempt outcome.
+    pub outcome: UpstreamAttemptOutcome,
+    /// Upstream HTTP status when one was received.
+    pub status_code: Option<u16>,
+    /// Whether another attempt follows this one.
+    pub will_retry: bool,
+    /// Retry delay selected after this attempt.
+    pub retry_delay: Option<Duration>,
+}
+
+/// Thread-safe callback for completed upstream attempts.
+pub type UpstreamAttemptObserver = dyn Fn(UpstreamAttemptObservation) + Send + Sync;
 
 /// A boxed client-specific error preserved as the source of a routed call failure.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -156,4 +197,18 @@ impl RoutingFallbackReason {
 pub trait RoutedLlmClient: Send + Sync {
     /// Make a request
     async fn call(&self, request: Request) -> Result<Response, LlmClientError>;
+
+    /// Make a request and report completed physical upstream attempts when supported.
+    ///
+    /// Implementations without an attempt boundary may rely on this default and
+    /// still participate in routing. The observer never receives request or
+    /// response payloads.
+    async fn call_with_attempt_observer(
+        &self,
+        request: Request,
+        observer: &UpstreamAttemptObserver,
+    ) -> Result<Response, LlmClientError> {
+        let _ = observer;
+        self.call(request).await
+    }
 }

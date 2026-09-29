@@ -15,6 +15,10 @@ use switchyard_protocol::{
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::observation::LlmCallTraceOutcome;
+
+type TraceCompletion = Box<dyn FnOnce(LlmCallTraceOutcome) + Send>;
+
 /// Records request parameters represented directly by the neutral IR.
 pub(crate) fn record_gen_ai_request(span: &Span, request: &LlmRequest) {
     if request.stream {
@@ -45,9 +49,12 @@ pub(crate) fn record_gen_ai_request(span: &Span, request: &LlmRequest) {
     }
 }
 
-/// Adds terminal response and usage fields to the enclosing `libsy.client_call`
-/// span without consuming or buffering a streaming response.
-pub(crate) fn observe_client_call(result: Result<Response>) -> Result<Response> {
+/// Observes the existing tracing span and, when requested, reports the terminal
+/// model-call outcome without consuming or buffering a response stream.
+pub(crate) fn observe_client_call_with_trace(
+    result: Result<Response>,
+    completion: Option<TraceCompletion>,
+) -> Result<Response> {
     let span = Span::current();
     match result {
         Ok(mut response) => {
@@ -55,11 +62,14 @@ pub(crate) fn observe_client_call(result: Result<Response>) -> Result<Response> 
                 LlmResponse::Agg(agg) => {
                     span.record("outcome", "ok");
                     record_gen_ai_response(&span, &agg);
+                    if let Some(completion) = completion {
+                        completion(LlmCallTraceOutcome::Ok);
+                    }
                     response.llm_response = LlmResponse::Agg(agg);
                 }
                 LlmResponse::Stream(stream) => {
                     response.llm_response =
-                        LlmResponse::Stream(observe_client_stream(stream, span));
+                        LlmResponse::Stream(observe_client_stream(stream, span, completion));
                 }
             }
             Ok(response)
@@ -79,17 +89,27 @@ pub(crate) fn observe_client_call(result: Result<Response>) -> Result<Response> 
                 ),
                 _ => record_client_error(&span, &error_type, &error),
             }
+            if let Some(completion) = completion {
+                completion(LlmCallTraceOutcome::Error {
+                    error_type: error_type.into_owned(),
+                });
+            }
             Err(error)
         }
     }
 }
 
-fn observe_client_stream(stream: LlmResponseStream, span: Span) -> LlmResponseStream {
+fn observe_client_stream(
+    stream: LlmResponseStream,
+    span: Span,
+    completion: Option<TraceCompletion>,
+) -> LlmResponseStream {
     Box::pin(ObservedClientStream {
         stream,
         observer: Some(ClientStreamObserver {
             span,
             outcome: Outcome::Open,
+            completion,
         }),
     })
 }
@@ -244,7 +264,7 @@ impl Stream for ObservedClientStream {
 }
 
 /// What the span has recorded for this stream so far.
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Outcome {
     /// Still streaming. Dropping the response now is a cancellation.
     Open,
@@ -259,6 +279,7 @@ enum Outcome {
 struct ClientStreamObserver {
     span: Span,
     outcome: Outcome,
+    completion: Option<TraceCompletion>,
 }
 
 impl ClientStreamObserver {
@@ -281,6 +302,9 @@ impl ClientStreamObserver {
                 let error_type = llm_client_error_type(error);
                 record_client_error(&self.span, &error_type, error);
                 self.outcome = Outcome::Failed;
+                self.finish(LlmCallTraceOutcome::Error {
+                    error_type: error_type.into_owned(),
+                });
             }
         }
         self.outcome == Outcome::Failed
@@ -300,10 +324,16 @@ impl ClientStreamObserver {
             LlmResponseChunk::DecodeError { message } => {
                 record_client_error(&self.span, "response_translation", message);
                 self.outcome = Outcome::Failed;
+                self.finish(LlmCallTraceOutcome::Error {
+                    error_type: "response_translation".into(),
+                });
             }
             LlmResponseChunk::StreamError { message } => {
                 record_client_error(&self.span, "502", message);
                 self.outcome = Outcome::Failed;
+                self.finish(LlmCallTraceOutcome::Error {
+                    error_type: "502".into(),
+                });
             }
             _ => {}
         }
@@ -316,12 +346,30 @@ impl ClientStreamObserver {
             self.outcome = Outcome::Completed;
         }
     }
+
+    fn finish(&mut self, outcome: LlmCallTraceOutcome) {
+        if let Some(completion) = self.completion.take() {
+            completion(outcome);
+        }
+    }
+
+    fn finish_during_drop(&mut self, outcome: LlmCallTraceOutcome) {
+        // Drop may run during unwinding, so an observer panic must not abort the process.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.finish(outcome);
+        }));
+    }
 }
 
 impl Drop for ClientStreamObserver {
     fn drop(&mut self) {
-        if self.outcome == Outcome::Open {
-            self.span.record("outcome", "cancelled");
+        match self.outcome {
+            Outcome::Open => {
+                self.span.record("outcome", "cancelled");
+                self.finish_during_drop(LlmCallTraceOutcome::Cancelled);
+            }
+            Outcome::Completed => self.finish_during_drop(LlmCallTraceOutcome::Ok),
+            Outcome::Failed => {}
         }
     }
 }
