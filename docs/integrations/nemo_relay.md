@@ -311,7 +311,7 @@ The plugin captures two existing Switchyard spans. Each routing or answer call
 becomes a `libsy.client_call` scope. Physical HTTP attempts and retries become
 `libsy.upstream_attempt` child scopes. Buffered calls close with the response;
 streaming calls close when the stream finishes, fails, or is dropped. The
-projection contains bounded routing metadata only and does not copy prompts,
+projection contains allowlisted, payload-free routing metadata only and does not copy prompts,
 responses, provider error bodies, or credentials into Relay.
 
 `switchyard.call_phase` records when Switchyard issued a client call:

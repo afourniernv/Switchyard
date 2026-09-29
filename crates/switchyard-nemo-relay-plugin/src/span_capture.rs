@@ -141,7 +141,7 @@ impl CapturedSpan {
         let status = span_status(&metadata);
         let mut scope = runtime.scope_at(
             self.name,
-            ScopeType::Custom,
+            relay_scope_type(self.name),
             None,
             Some(&metadata),
             None,
@@ -208,6 +208,14 @@ fn captures(metadata: &Metadata<'_>) -> bool {
     metadata.target() == "libsy" && matches!(metadata.name(), CLIENT_CALL | UPSTREAM_ATTEMPT)
 }
 
+fn relay_scope_type(name: &str) -> ScopeType {
+    if name == CLIENT_CALL {
+        ScopeType::Llm
+    } else {
+        ScopeType::Custom
+    }
+}
+
 fn is_safe_field(name: &str) -> bool {
     matches!(
         name,
@@ -216,6 +224,7 @@ fn is_safe_field(name: &str) -> bool {
             | "switchyard.candidate_count"
             | "switchyard.call_phase"
             | "selected_model"
+            | "model"
             | "wire_format"
             | "attempt"
             | "max_attempts"
@@ -259,7 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn captures_only_bounded_client_and_attempt_fields() {
+    async fn captures_only_allowlisted_client_and_attempt_fields() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&captured);
         let result = capture_client_spans(
@@ -276,6 +285,7 @@ mod tests {
                         .instrument(tracing::debug_span!(
                             target: "libsy",
                             UPSTREAM_ATTEMPT,
+                            model = "target/model",
                             attempt = 1_u64,
                             outcome = "error",
                             error = "provider body",
@@ -311,6 +321,7 @@ mod tests {
             panic!("expected one client call: {spans:?}");
         };
         assert_eq!(call.name, CLIENT_CALL);
+        assert!(matches!(relay_scope_type(call.name), ScopeType::Llm));
         assert_eq!(call.fields["selected_model"], "target/model");
         assert_eq!(call.fields["switchyard.call_phase"], "routing");
         assert_eq!(call.fields["outcome"], "ok");
@@ -319,6 +330,8 @@ mod tests {
             panic!("expected one upstream attempt: {call:?}");
         };
         assert_eq!(attempt.name, UPSTREAM_ATTEMPT);
+        assert!(matches!(relay_scope_type(attempt.name), ScopeType::Custom));
+        assert_eq!(attempt.fields["model"], "target/model");
         assert_eq!(attempt.fields["attempt"], 1);
         assert_eq!(attempt.fields["outcome"], "error");
         assert!(!attempt.fields.contains_key("error"));
@@ -327,6 +340,7 @@ mod tests {
 
         call.sanitize(&ProviderKeyRedactor::new(&["target/model".into()]));
         assert_eq!(call.fields["selected_model"], "[REDACTED]");
+        assert_eq!(call.children[0].fields["model"], "[REDACTED]");
     }
 
     #[tokio::test]
