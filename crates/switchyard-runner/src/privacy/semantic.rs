@@ -144,20 +144,26 @@ impl SemanticPrivacyClassifier {
             selected,
             clear_score,
         } = verdict;
-        if selected == PrivacyVerdict::NoSensitiveContent && clear_score >= self.clear_threshold {
-            return PrivacyDecision::semantic(
-                PrivacyLane::Standard,
-                selected.as_str(),
-                Some(clear_score),
-                self.clear_threshold,
-            );
+        match selected {
+            PrivacyVerdict::NoSensitiveContent if clear_score >= self.clear_threshold => {
+                PrivacyDecision::semantic(
+                    PrivacyLane::Standard,
+                    selected.as_str(),
+                    Some(clear_score),
+                    self.clear_threshold,
+                )
+            }
+            PrivacyVerdict::NoSensitiveContent => {
+                self.restricted("below_clear_threshold", Some(clear_score))
+            }
+            PrivacyVerdict::Uncertain => self.restricted(selected.as_str(), Some(clear_score)),
+            PrivacyVerdict::PersonalData
+            | PrivacyVerdict::Credentials
+            | PrivacyVerdict::ConfidentialData
+            | PrivacyVerdict::RegulatedData => self
+                .restricted(selected.as_str(), Some(clear_score))
+                .retained_for_task(),
         }
-        let reason = if selected == PrivacyVerdict::NoSensitiveContent {
-            "below_clear_threshold"
-        } else {
-            selected.as_str()
-        };
-        self.restricted(reason, Some(clear_score))
     }
 
     fn restricted(&self, reason_code: &'static str, clear_score: Option<f64>) -> PrivacyDecision {
@@ -743,54 +749,69 @@ mod tests {
         probabilities(&mut incomplete).remove("uncertain");
         let mut unnormalized = response("no_sensitive_content", Some(0.95));
         probabilities(&mut unnormalized).insert("personal_data".into(), Probability(0.2));
-        for (reply, lane, reason, score) in [
+        for (reply, lane, reason, score, retained) in [
             (
                 Ok(response("no_sensitive_content", Some(0.95))),
                 PrivacyLane::Standard,
                 "no_sensitive_content",
                 Some(0.95),
+                false,
             ),
             (
                 Ok(response("no_sensitive_content", Some(0.8))),
                 PrivacyLane::Restricted,
                 "below_clear_threshold",
                 Some(0.8),
+                false,
             ),
             (
                 Ok(response("confidential_data", Some(0.1))),
                 PrivacyLane::Restricted,
                 "confidential_data",
                 Some(0.1),
+                true,
+            ),
+            (
+                Ok(response("uncertain", Some(0.5))),
+                PrivacyLane::Restricted,
+                "uncertain",
+                Some(0.5),
+                false,
             ),
             (
                 Ok(response("no_sensitive_content", None)),
                 PrivacyLane::Restricted,
                 "invalid_verdict",
                 None,
+                false,
             ),
             (
                 Ok(incomplete),
                 PrivacyLane::Restricted,
                 "invalid_verdict",
                 None,
+                false,
             ),
             (
                 Ok(unnormalized),
                 PrivacyLane::Restricted,
                 "invalid_verdict",
                 None,
+                false,
             ),
             (
                 Err(failure),
                 PrivacyLane::Restricted,
                 "classifier_failed",
                 None,
+                false,
             ),
         ] {
             let decision = classifier(reply).assess(&Request::default()).await;
             assert_eq!(decision.lane.as_str(), lane.as_str());
             assert_eq!(decision.reason_code, reason);
             assert_eq!(decision.clear_score, score);
+            assert_eq!(decision.retain_for_task, retained);
         }
     }
 

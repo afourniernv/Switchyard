@@ -74,6 +74,7 @@ pub(crate) struct PrivacyDecision {
     pub(crate) reason_code: &'static str,
     pub(crate) clear_score: Option<f64>,
     pub(crate) clear_threshold: Option<f64>,
+    retain_for_task: bool,
 }
 
 #[derive(Clone, Copy, IntoStaticStr)]
@@ -100,6 +101,7 @@ impl PrivacyDecision {
             reason_code,
             clear_score: None,
             clear_threshold: None,
+            retain_for_task: false,
         }
     }
 
@@ -115,7 +117,13 @@ impl PrivacyDecision {
             reason_code,
             clear_score,
             clear_threshold: Some(clear_threshold),
+            retain_for_task: false,
         }
+    }
+
+    const fn retained_for_task(mut self) -> Self {
+        self.retain_for_task = true;
+        self
     }
 
     const fn all_clear() -> Self {
@@ -209,7 +217,8 @@ impl PrivacyPolicy {
                 PrivacyLane::Restricted,
                 PrivacySource::ExternalSignal,
                 "restricted",
-            ));
+            )
+            .retained_for_task());
         }
         if let Some(inspector) = &self.inspector {
             match inspector.inspect(request) {
@@ -218,7 +227,8 @@ impl PrivacyPolicy {
                         PrivacyLane::Restricted,
                         PrivacySource::Deterministic,
                         reason_code,
-                    ));
+                    )
+                    .retained_for_task());
                 }
                 Assessment::Indeterminate(reason_code) => {
                     return Ok(PrivacyDecision::new(
@@ -273,7 +283,7 @@ impl TaskRestrictions {
         if restricted.len() >= MAX_RESTRICTED_TASKS {
             return PrivacyDecision::task_restriction("capacity_exhausted");
         }
-        if matches!(decision.lane, PrivacyLane::Restricted) {
+        if decision.retain_for_task {
             restricted.insert(task_id.to_string());
         }
         decision
@@ -438,5 +448,23 @@ mod tests {
         let exhausted = tasks.retain("another-task", PrivacyDecision::all_clear());
         assert_eq!(retained.reason_code, "retained_restriction");
         assert_eq!(exhausted.reason_code, "capacity_exhausted");
+    }
+
+    #[test]
+    fn task_retention_persists_only_affirmative_restrictions() {
+        let tasks = TaskRestrictions::default();
+        let precautionary =
+            PrivacyDecision::semantic(PrivacyLane::Restricted, "invalid_verdict", None, 0.9);
+        assert!(matches!(
+            tasks.retain("transient", precautionary).lane,
+            PrivacyLane::Restricted
+        ));
+        assert!(tasks.restriction("transient").is_none());
+
+        let affirmative =
+            PrivacyDecision::semantic(PrivacyLane::Restricted, "confidential_data", Some(0.1), 0.9)
+                .retained_for_task();
+        tasks.retain("sensitive", affirmative);
+        assert!(tasks.restriction("sensitive").is_some());
     }
 }
