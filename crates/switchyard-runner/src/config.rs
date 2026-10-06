@@ -96,6 +96,7 @@ struct PrivacyConfig {
 struct PrivacyClassifierConfig {
     target: String,
     clear_threshold: f64,
+    instructions: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,6 +448,7 @@ impl DeploymentConfig {
         Ok(Some(SemanticPrivacyClassifier::new(
             target.model.clone(),
             Arc::clone(target.client),
+            classifier.instructions.as_ref(),
             classifier.clear_threshold,
         )))
     }
@@ -1455,6 +1457,10 @@ clear_threshold = 0.9
     fn semantic_privacy_classifier_config_is_bounded_and_isolated() -> RunnerResult<()> {
         let configured = semantic_privacy_config();
         Runner::from_toml(&configured)?;
+        Runner::from_toml(&configured.replace(
+            "clear_threshold = 0.9",
+            "clear_threshold = 0.9\ninstructions = { policy = \"custom\" }",
+        ))?;
 
         for (invalid, expected) in [
             (

@@ -678,6 +678,7 @@ mod tests {
             Arc::new(VerdictClient {
                 calls: Arc::clone(&classifier_calls),
             }),
+            None,
             0.9,
         );
         let route = Route::from_lane(standard, None, ModelCapabilities::default()).with_privacy(

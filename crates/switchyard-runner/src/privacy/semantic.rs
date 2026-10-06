@@ -31,13 +31,14 @@ impl SemanticPrivacyClassifier {
     pub(crate) fn new(
         target: ModelId,
         client: Arc<dyn RoutedDecisionClient>,
+        instructions: Option<&Value>,
         clear_threshold: f64,
     ) -> Self {
         Self {
             target,
             client,
             clear_threshold,
-            question: privacy_question(),
+            question: privacy_question(instructions),
         }
     }
 
@@ -190,7 +191,7 @@ impl PrivacyVerdict {
     }
 }
 
-fn privacy_question() -> DecisionQuestion {
+fn privacy_question(instructions: Option<&Value>) -> DecisionQuestion {
     let options = PrivacyVerdict::ALL
         .into_iter()
         .map(|verdict| ChoiceOption {
@@ -199,7 +200,9 @@ fn privacy_question() -> DecisionQuestion {
         })
         .collect();
     DecisionQuestion {
-        instructions: Value::String(include_str!("semantic_prompt.txt").trim().into()),
+        instructions: instructions
+            .cloned()
+            .unwrap_or_else(|| Value::String(include_str!("semantic_prompt.txt").trim().into())),
         kind: DecisionKind::Choice { options },
     }
 }
@@ -278,12 +281,18 @@ mod tests {
         SemanticPrivacyClassifier::new(
             "privacy/model".into(),
             Arc::new(ReplyClient(Mutex::new(Some(reply)))),
+            None,
             0.9,
         )
     }
 
     #[test]
     fn context_is_bounded_and_covers_outbound_request_state() {
+        let instructions = json!({"policy": "custom"});
+        assert_eq!(
+            privacy_question(Some(&instructions)).instructions,
+            instructions
+        );
         let classifier = classifier(Ok(response("no_sensitive_content", Some(1.0))));
         let mut request = Request::default();
         request.llm_request.messages.push(Message::text(
