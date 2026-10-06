@@ -1,118 +1,143 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Typed semantic preflight for contextual privacy decisions.
+//! Semantic preflight for contextual privacy decisions.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use serde::Serialize;
-use serde_json::{Map, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use strum_macros::{EnumString, IntoStaticStr};
 use switchyard_protocol::{
-    ChoiceOption, DecisionKind, DecisionQuestion, DecisionRequest, DecisionResponse, DecisionValue,
-    FormatId, InstructionBlock, LlmRequest, Message, ModelId, OutputParams, PreservationMetadata,
-    ProviderExtensions, ReasoningParams, Request, RoutedDecisionClient, ToolChoice, ToolDefinition,
+    ChoiceOption, ContentBlock, DecisionKind, DecisionQuestion, DecisionRequest, DecisionResponse,
+    DecisionValue, FormatId, InstructionBlock, LlmRequest, LlmResponse, Message, ModelId,
+    OutputParams, PreservationMetadata, ProviderExtensions, ReasoningParams, Request, Role,
+    RoutedDecisionClient, RoutedLlmClient, ToolChoice, ToolDefinition, completion_text,
 };
 
 use super::{PrivacyDecision, PrivacyLane};
 
 const MAX_PRIVACY_CLASSIFIER_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_TOKENS: u64 = 512;
 const PROBABILITY_SUM_TOLERANCE: f64 = 1e-6;
 const QUESTION_ID: &str = "privacy";
 
 pub(crate) struct SemanticPrivacyClassifier {
-    target: ModelId,
-    client: Arc<dyn RoutedDecisionClient>,
+    backend: SemanticBackend,
     clear_threshold: f64,
-    question: DecisionQuestion,
+}
+
+enum SemanticBackend {
+    Decision {
+        target: ModelId,
+        client: Arc<dyn RoutedDecisionClient>,
+        question: Box<DecisionQuestion>,
+    },
+    Llm {
+        target: ModelId,
+        client: Arc<dyn RoutedLlmClient>,
+    },
+}
+
+struct SemanticVerdict {
+    selected: PrivacyVerdict,
+    clear_score: f64,
 }
 
 impl SemanticPrivacyClassifier {
-    pub(crate) fn new(
+    pub(crate) fn decision(
         target: ModelId,
         client: Arc<dyn RoutedDecisionClient>,
         instructions: Option<&Value>,
         clear_threshold: f64,
     ) -> Self {
         Self {
-            target,
-            client,
+            backend: SemanticBackend::Decision {
+                target,
+                client,
+                question: Box::new(privacy_question(instructions)),
+            },
             clear_threshold,
-            question: privacy_question(instructions),
+        }
+    }
+
+    pub(crate) fn llm(
+        target: ModelId,
+        client: Arc<dyn RoutedLlmClient>,
+        clear_threshold: f64,
+    ) -> Self {
+        Self {
+            backend: SemanticBackend::Llm { target, client },
+            clear_threshold,
         }
     }
 
     pub(crate) async fn assess(&self, request: &Request) -> PrivacyDecision {
-        let Ok(request) = self.request(request) else {
-            return self.restricted("input_unavailable", None);
-        };
-        let Ok(response) = self.client.call(request).await else {
-            return self.restricted("classifier_failed", None);
-        };
-        self.decision(&response)
-    }
-
-    fn request(&self, request: &Request) -> Result<DecisionRequest, ()> {
-        let context = serialize_classifier_context(&request.llm_request)?;
-        Ok(DecisionRequest {
-            model: Some(self.target.clone()),
-            context,
-            questions: BTreeMap::from([(QUESTION_ID.into(), self.question.clone())]),
-        })
-    }
-
-    fn decision(&self, response: &DecisionResponse) -> PrivacyDecision {
-        let Some(DecisionValue::Choice {
-            selected,
-            probabilities: Some(probabilities),
-        }) = response
-            .answers
-            .get(QUESTION_ID)
-            .map(|answer| &answer.value)
-        else {
-            return self.restricted("invalid_verdict", None);
-        };
-        let Ok(verdict) = selected.parse::<PrivacyVerdict>() else {
-            return self.restricted("invalid_verdict", None);
-        };
-        let valid_distribution = probabilities.len() == PrivacyVerdict::ALL.len()
-            && PrivacyVerdict::ALL.iter().all(|verdict| {
-                probabilities
-                    .get(verdict.as_str())
-                    .is_some_and(|probability| {
-                        probability.0.is_finite() && (0.0..=1.0).contains(&probability.0)
-                    })
-            })
-            && (probabilities
-                .values()
-                .map(|probability| probability.0)
-                .sum::<f64>()
-                - 1.0)
-                .abs()
-                <= PROBABILITY_SUM_TOLERANCE;
-        if !valid_distribution {
-            return self.restricted("invalid_verdict", None);
+        match self.verdict(request).await {
+            Ok(verdict) => self.apply(verdict),
+            Err(reason) => self.restricted(reason, None),
         }
-        let clear_score = probabilities
-            .get(PrivacyVerdict::NoSensitiveContent.as_str())
-            .map(|probability| probability.0);
-        let Some(clear_score) = clear_score else {
-            return self.restricted("invalid_verdict", None);
-        };
-        if verdict == PrivacyVerdict::NoSensitiveContent && clear_score >= self.clear_threshold {
+    }
+
+    async fn verdict(&self, request: &Request) -> Result<SemanticVerdict, &'static str> {
+        let context = serialize_classifier_context(&request.llm_request)
+            .map_err(|()| "input_unavailable")?;
+        match &self.backend {
+            SemanticBackend::Decision {
+                target,
+                client,
+                question,
+            } => {
+                let request = decision_request(
+                    target,
+                    question,
+                    context.into_value().map_err(|()| "input_unavailable")?,
+                );
+                let response = client
+                    .call(request)
+                    .await
+                    .map_err(|_| "classifier_failed")?;
+                decision_verdict(&response).ok_or("invalid_verdict")
+            }
+            SemanticBackend::Llm { target, client } => {
+                let request = llm_request(
+                    target,
+                    context.into_string().map_err(|()| "input_unavailable")?,
+                );
+                let response = client
+                    .call(request)
+                    .await
+                    .map_err(|_| "classifier_failed")?;
+                let LlmResponse::Agg(response) = response.llm_response else {
+                    return Err("invalid_verdict");
+                };
+                let verdict: LlmVerdict = serde_json::from_str(completion_text(&response).trim())
+                    .map_err(|_| "invalid_verdict")?;
+                SemanticVerdict::new(verdict.reason_code, verdict.clear_score)
+                    .ok_or("invalid_verdict")
+            }
+        }
+    }
+
+    fn apply(&self, verdict: SemanticVerdict) -> PrivacyDecision {
+        let SemanticVerdict {
+            selected,
+            clear_score,
+        } = verdict;
+        if selected == PrivacyVerdict::NoSensitiveContent && clear_score >= self.clear_threshold {
             return PrivacyDecision::semantic(
                 PrivacyLane::Standard,
-                verdict.as_str(),
+                selected.as_str(),
                 Some(clear_score),
                 self.clear_threshold,
             );
         }
-        let reason = if verdict == PrivacyVerdict::NoSensitiveContent {
+        let reason = if selected == PrivacyVerdict::NoSensitiveContent {
             "below_clear_threshold"
         } else {
-            verdict.as_str()
+            selected.as_str()
         };
         self.restricted(reason, Some(clear_score))
     }
@@ -127,10 +152,57 @@ impl SemanticPrivacyClassifier {
     }
 }
 
-fn serialize_classifier_context(request: &LlmRequest) -> Result<Value, ()> {
+impl SemanticVerdict {
+    fn new(selected: PrivacyVerdict, clear_score: f64) -> Option<Self> {
+        (clear_score.is_finite() && (0.0..=1.0).contains(&clear_score)).then_some(Self {
+            selected,
+            clear_score,
+        })
+    }
+}
+
+fn decision_verdict(response: &DecisionResponse) -> Option<SemanticVerdict> {
+    let Some(DecisionValue::Choice {
+        selected,
+        probabilities: Some(probabilities),
+    }) = response
+        .answers
+        .get(QUESTION_ID)
+        .map(|answer| &answer.value)
+    else {
+        return None;
+    };
+    let Ok(verdict) = selected.parse::<PrivacyVerdict>() else {
+        return None;
+    };
+    let valid_distribution = probabilities.len() == PrivacyVerdict::ALL.len()
+        && PrivacyVerdict::ALL.iter().all(|verdict| {
+            probabilities
+                .get(verdict.as_str())
+                .is_some_and(|probability| {
+                    probability.0.is_finite() && (0.0..=1.0).contains(&probability.0)
+                })
+        })
+        && (probabilities
+            .values()
+            .map(|probability| probability.0)
+            .sum::<f64>()
+            - 1.0)
+            .abs()
+            <= PROBABILITY_SUM_TOLERANCE;
+    if !valid_distribution {
+        return None;
+    }
+    let clear_score = probabilities
+        .get(PrivacyVerdict::NoSensitiveContent.as_str())
+        .map(|probability| probability.0);
+    SemanticVerdict::new(verdict, clear_score?)
+}
+
+fn serialize_classifier_context(request: &LlmRequest) -> Result<BoundedJson, ()> {
     let mut json = BoundedJson::default();
     serde_json::to_writer(&mut json, &PrivacyClassifierContext::new(request)).map_err(|_| ())?;
-    json.into_value()
+    Ok(json)
 }
 
 #[derive(Serialize)]
@@ -194,6 +266,10 @@ impl BoundedJson {
     fn into_value(self) -> Result<Value, ()> {
         serde_json::from_slice(&self.0).map_err(|_| ())
     }
+
+    fn into_string(self) -> Result<String, ()> {
+        String::from_utf8(self.0).map_err(|_| ())
+    }
 }
 
 impl Write for BoundedJson {
@@ -210,7 +286,8 @@ impl Write for BoundedJson {
     }
 }
 
-#[derive(Clone, Copy, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[derive(Clone, Copy, Deserialize, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 enum PrivacyVerdict {
     NoSensitiveContent,
@@ -219,6 +296,13 @@ enum PrivacyVerdict {
     ConfidentialData,
     RegulatedData,
     Uncertain,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LlmVerdict {
+    clear_score: f64,
+    reason_code: PrivacyVerdict,
 }
 
 impl PrivacyVerdict {
@@ -263,6 +347,72 @@ fn privacy_question(instructions: Option<&Value>) -> DecisionQuestion {
     }
 }
 
+fn decision_request(
+    target: &ModelId,
+    question: &DecisionQuestion,
+    context: Value,
+) -> DecisionRequest {
+    DecisionRequest {
+        model: Some(target.clone()),
+        context,
+        questions: BTreeMap::from([(QUESTION_ID.into(), question.clone())]),
+    }
+}
+
+fn llm_request(target: &ModelId, context: String) -> Request {
+    let mut llm_request = LlmRequest {
+        model: Some(target.to_string()),
+        instructions: vec![InstructionBlock {
+            role: Role::System,
+            content: vec![ContentBlock::Text {
+                text: format!(
+                    "{}\n\n{}",
+                    include_str!("semantic_prompt.txt").trim(),
+                    include_str!("semantic_llm_prompt.txt").trim()
+                ),
+            }],
+        }],
+        messages: vec![Message::text(Role::User, context)],
+        output: OutputParams {
+            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
+            response_format: Some(response_format()),
+            ..OutputParams::default()
+        },
+        ..LlmRequest::default()
+    };
+    llm_request
+        .extensions
+        .fields
+        .insert("store".into(), Value::Bool(false));
+    Request {
+        llm_request,
+        raw_request: None,
+        metadata: None,
+    }
+}
+
+fn response_format() -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "switchyard_privacy_verdict",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "clear_score": { "type": "number", "minimum": 0, "maximum": 1 },
+                    "reason_code": {
+                        "type": "string",
+                        "enum": PrivacyVerdict::ALL.map(PrivacyVerdict::as_str)
+                    }
+                },
+                "required": ["clear_score", "reason_code"]
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -270,8 +420,8 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use switchyard_protocol::{
-        ContentBlock, DecisionAnswer, InstructionBlock, LlmClientError, Message, Probability, Role,
-        ToolCall, ToolDefinition, ToolResult, Usage,
+        ContentBlock, DecisionAnswer, InstructionBlock, LlmClientError, Message, Probability,
+        Response, Role, ToolCall, ToolDefinition, ToolResult, Usage, text_response,
     };
 
     use super::*;
@@ -284,6 +434,19 @@ mod tests {
             &self,
             _request: DecisionRequest,
         ) -> Result<DecisionResponse, LlmClientError> {
+            self.0
+                .lock()
+                .expect("reply lock")
+                .take()
+                .expect("one classifier call")
+        }
+    }
+
+    struct LlmReplyClient(Mutex<Option<Result<Response, LlmClientError>>>);
+
+    #[async_trait]
+    impl RoutedLlmClient for LlmReplyClient {
+        async fn call(&self, _request: Request) -> Result<Response, LlmClientError> {
             self.0
                 .lock()
                 .expect("reply lock")
@@ -334,7 +497,7 @@ mod tests {
     }
 
     fn classifier(reply: Result<DecisionResponse, LlmClientError>) -> SemanticPrivacyClassifier {
-        SemanticPrivacyClassifier::new(
+        SemanticPrivacyClassifier::decision(
             "privacy/model".into(),
             Arc::new(ReplyClient(Mutex::new(Some(reply)))),
             None,
@@ -342,14 +505,25 @@ mod tests {
         )
     }
 
+    fn llm_classifier(reply: Result<Response, LlmClientError>) -> SemanticPrivacyClassifier {
+        SemanticPrivacyClassifier::llm(
+            "privacy/model".into(),
+            Arc::new(LlmReplyClient(Mutex::new(Some(reply)))),
+            0.9,
+        )
+    }
+
+    fn llm_response(text: &str) -> Response {
+        Response {
+            llm_response: LlmResponse::Agg(text_response(None, text)),
+            metadata: None,
+            upstream_headers: Default::default(),
+        }
+    }
+
     #[test]
     fn context_is_bounded_and_covers_privacy_relevant_request_state() {
         let instructions = json!({"policy": "custom"});
-        assert_eq!(
-            privacy_question(Some(&instructions)).instructions,
-            instructions
-        );
-        let classifier = classifier(Ok(response("no_sensitive_content", Some(1.0))));
         let mut request = Request::default();
         request.llm_request.messages.push(Message::text(
             switchyard_protocol::Role::User,
@@ -415,8 +589,10 @@ mod tests {
             .get_or_insert_default()
             .insert("metadata_marker".into(), String::new());
 
-        let decision = classifier.request(&request).expect("bounded context");
-        let encoded = decision.context.to_string();
+        let encoded = serialize_classifier_context(&request.llm_request)
+            .expect("bounded context")
+            .into_string()
+            .expect("json is utf-8");
         for marker in [
             "normalized_marker",
             "reasoning_marker",
@@ -444,11 +620,44 @@ mod tests {
             assert!(!encoded.contains(marker), "unexpected {marker}");
         }
 
+        let decision_request = decision_request(
+            &"privacy/model".into(),
+            &privacy_question(Some(&instructions)),
+            serde_json::from_str(&encoded).expect("context value"),
+        );
+        assert_eq!(decision_request.model.as_deref(), Some("privacy/model"));
+        assert!(decision_request.questions.contains_key(QUESTION_ID));
+        assert_eq!(
+            decision_request.questions[QUESTION_ID].instructions,
+            instructions
+        );
+        assert!(
+            decision_request
+                .context
+                .to_string()
+                .contains("normalized_marker")
+        );
+
+        let classifier_request = llm_request(&"privacy/model".into(), encoded);
+        let llm = &classifier_request.llm_request;
+        assert_eq!(llm.model.as_deref(), Some("privacy/model"));
+        assert_eq!(
+            llm.extensions.fields.get("store"),
+            Some(&Value::Bool(false))
+        );
+        assert!(llm.output.response_format.is_some());
+        assert!(llm.instructions[0].content.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text.contains("clear_score"))
+        ));
+        assert!(!llm.stream);
+        assert!(classifier_request.raw_request.is_none());
+        assert!(classifier_request.metadata.is_none());
+
         request.llm_request.messages = vec![Message::text(
             switchyard_protocol::Role::User,
             "x".repeat(MAX_PRIVACY_CLASSIFIER_CONTEXT_BYTES),
         )];
-        assert!(classifier.request(&request).is_err());
+        assert!(serialize_classifier_context(&request.llm_request).is_err());
     }
 
     #[tokio::test]
@@ -505,6 +714,48 @@ mod tests {
             ),
         ] {
             let decision = classifier(reply).assess(&Request::default()).await;
+            assert_eq!(decision.lane.as_str(), lane.as_str());
+            assert_eq!(decision.reason_code, reason);
+            assert_eq!(decision.clear_score, score);
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_verdicts_and_failures_fail_closed() {
+        let failure = LlmClientError::Configuration {
+            message: "unavailable".into(),
+        };
+        for (reply, lane, reason, score) in [
+            (
+                Ok(llm_response(
+                    r#"{"clear_score":0.95,"reason_code":"no_sensitive_content"}"#,
+                )),
+                PrivacyLane::Standard,
+                "no_sensitive_content",
+                Some(0.95),
+            ),
+            (
+                Ok(llm_response(
+                    r#"{"clear_score":1.1,"reason_code":"no_sensitive_content"}"#,
+                )),
+                PrivacyLane::Restricted,
+                "invalid_verdict",
+                None,
+            ),
+            (
+                Ok(llm_response("not json")),
+                PrivacyLane::Restricted,
+                "invalid_verdict",
+                None,
+            ),
+            (
+                Err(failure),
+                PrivacyLane::Restricted,
+                "classifier_failed",
+                None,
+            ),
+        ] {
+            let decision = llm_classifier(reply).assess(&Request::default()).await;
             assert_eq!(decision.lane.as_str(), lane.as_str());
             assert_eq!(decision.reason_code, reason);
             assert_eq!(decision.clear_score, score);
