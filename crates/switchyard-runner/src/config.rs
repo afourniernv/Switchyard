@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use libsy::RuntimeModels;
+use libsy::{ClassifierResponseFormat, RuntimeModels};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -99,6 +99,8 @@ struct PrivacyClassifierConfig {
     target: String,
     clear_threshold: f64,
     instructions: Option<Value>,
+    prompt: Option<String>,
+    response_format_type: Option<ClassifierResponseFormat>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -451,6 +453,11 @@ impl DeploymentConfig {
         }
         let classifier = match classifier.kind {
             PrivacyClassifierKind::Decision => {
+                if classifier.prompt.is_some() || classifier.response_format_type.is_some() {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} decision privacy classifier cannot configure prompt or response_format_type"
+                    )));
+                }
                 let target =
                     self.resolve_decision_target(route_name, &classifier.target, decision_clients)?;
                 if standard_decision.is_some_and(|standard| {
@@ -472,6 +479,13 @@ impl DeploymentConfig {
                 if classifier.instructions.is_some() {
                     return Err(RunnerError::configuration(format!(
                         "route {route_name} LLM privacy classifier cannot configure instructions"
+                    )));
+                }
+                if let Some(prompt) = classifier.prompt.as_deref()
+                    && prompt.trim().is_empty()
+                {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} privacy classifier prompt must not be empty"
                     )));
                 }
                 let target = self.targets.get(&classifier.target).ok_or_else(|| {
@@ -524,6 +538,8 @@ impl DeploymentConfig {
                 SemanticPrivacyClassifier::llm(
                     target.id.clone(),
                     client,
+                    classifier.prompt.as_deref(),
+                    classifier.response_format_type.unwrap_or_default(),
                     classifier.clear_threshold,
                 )
             }
@@ -1559,12 +1575,18 @@ clear_threshold = 0.9
     fn semantic_privacy_classifier_configs_are_bounded_and_isolated() -> RunnerResult<()> {
         let decision = semantic_privacy_config();
         let llm = llm_semantic_privacy_config();
-        Runner::from_toml(&decision)?;
-        Runner::from_toml(&llm)?;
-        Runner::from_toml(&decision.replace(
+        let decision_override = decision.replace(
             "clear_threshold = 0.9",
             "clear_threshold = 0.9\ninstructions = { policy = \"custom\" }",
-        ))?;
+        );
+        let llm_override = llm.replace(
+            "clear_threshold = 0.9",
+            "clear_threshold = 0.9\nprompt = \"Custom privacy policy.\"\nresponse_format_type = \"json_object\"",
+        );
+        Runner::from_toml(&decision)?;
+        Runner::from_toml(&llm)?;
+        Runner::from_toml(&decision_override)?;
+        Runner::from_toml(&llm_override)?;
 
         for (invalid, expected) in [
             (
@@ -1574,6 +1596,20 @@ clear_threshold = 0.9
             (
                 decision.replace("clear_threshold = 0.9", "clear_threshold = 1.1"),
                 "clear_threshold must be between 0 and 1",
+            ),
+            (
+                decision_override.replace(
+                    "instructions = { policy = \"custom\" }",
+                    "prompt = \"not valid for decision\"",
+                ),
+                "decision privacy classifier cannot configure prompt",
+            ),
+            (
+                decision_override.replace(
+                    "instructions = { policy = \"custom\" }",
+                    "response_format_type = \"json_schema\"",
+                ),
+                "decision privacy classifier cannot configure prompt or response_format_type",
             ),
             (
                 format!(
@@ -1586,6 +1622,17 @@ clear_threshold = 0.9
             (
                 llm.replace("target = \"privacy_classifier\"", "target = \"missing\""),
                 "privacy classifier references unknown target missing",
+            ),
+            (
+                llm_override.replace(
+                    "prompt = \"Custom privacy policy.\"",
+                    "instructions = { policy = \"not valid for llm\" }",
+                ),
+                "LLM privacy classifier cannot configure instructions",
+            ),
+            (
+                llm_override.replace("prompt = \"Custom privacy policy.\"", "prompt = \" \""),
+                "privacy classifier prompt must not be empty",
             ),
             (
                 llm.replace("target = \"privacy_classifier\"", "target = \"weak\""),

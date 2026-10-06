@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 
+use libsy::ClassifierResponseFormat;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use strum_macros::{EnumString, IntoStaticStr};
@@ -38,6 +39,8 @@ enum SemanticBackend {
     Llm {
         target: ModelId,
         client: Arc<dyn RoutedLlmClient>,
+        prompt: Option<String>,
+        response_format_type: ClassifierResponseFormat,
     },
 }
 
@@ -66,10 +69,17 @@ impl SemanticPrivacyClassifier {
     pub(crate) fn llm(
         target: ModelId,
         client: Arc<dyn RoutedLlmClient>,
+        prompt: Option<&str>,
+        response_format_type: ClassifierResponseFormat,
         clear_threshold: f64,
     ) -> Self {
         Self {
-            backend: SemanticBackend::Llm { target, client },
+            backend: SemanticBackend::Llm {
+                target,
+                client,
+                prompt: prompt.map(str::to_owned),
+                response_format_type,
+            },
             clear_threshold,
         }
     }
@@ -101,10 +111,17 @@ impl SemanticPrivacyClassifier {
                     .map_err(|_| "classifier_failed")?;
                 decision_verdict(&response).ok_or("invalid_verdict")
             }
-            SemanticBackend::Llm { target, client } => {
+            SemanticBackend::Llm {
+                target,
+                client,
+                prompt,
+                response_format_type,
+            } => {
                 let request = llm_request(
                     target,
                     context.into_string().map_err(|()| "input_unavailable")?,
+                    prompt.as_deref(),
+                    *response_format_type,
                 );
                 let response = client
                     .call(request)
@@ -113,7 +130,8 @@ impl SemanticPrivacyClassifier {
                 let LlmResponse::Agg(response) = response.llm_response else {
                     return Err("invalid_verdict");
                 };
-                let verdict: LlmVerdict = serde_json::from_str(completion_text(&response).trim())
+                let reply = completion_text(&response);
+                let verdict: LlmVerdict = serde_json::from_str(strip_json_fence(reply.trim()))
                     .map_err(|_| "invalid_verdict")?;
                 SemanticVerdict::new(verdict.reason_code, verdict.clear_score)
                     .ok_or("invalid_verdict")
@@ -359,23 +377,61 @@ fn decision_request(
     }
 }
 
-fn llm_request(target: &ModelId, context: String) -> Request {
+fn verdict_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "clear_score": { "type": "number", "minimum": 0, "maximum": 1 },
+            "reason_code": {
+                "type": "string",
+                "enum": PrivacyVerdict::ALL.map(PrivacyVerdict::as_str)
+            }
+        },
+        "required": ["clear_score", "reason_code"]
+    })
+}
+
+fn llm_request(
+    target: &ModelId,
+    context: String,
+    prompt: Option<&str>,
+    response_format_type: ClassifierResponseFormat,
+) -> Request {
+    let prompt = prompt.map(str::to_owned).unwrap_or_else(|| {
+        format!(
+            "{}\n\n{}",
+            include_str!("semantic_prompt.txt").trim(),
+            include_str!("semantic_llm_prompt.txt").trim()
+        )
+    });
+    let schema = verdict_schema();
+    let system_prompt = format!(
+        "{prompt}\n\nReturn exactly one JSON object matching this JSON Schema:\n{schema:#}"
+    );
+    let response_format = match response_format_type {
+        ClassifierResponseFormat::JsonSchema => json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "switchyard_privacy_verdict",
+                "strict": true,
+                "schema": schema,
+            }
+        }),
+        ClassifierResponseFormat::JsonObject => json!({"type": "json_object"}),
+    };
     let mut llm_request = LlmRequest {
         model: Some(target.to_string()),
         instructions: vec![InstructionBlock {
             role: Role::System,
             content: vec![ContentBlock::Text {
-                text: format!(
-                    "{}\n\n{}",
-                    include_str!("semantic_prompt.txt").trim(),
-                    include_str!("semantic_llm_prompt.txt").trim()
-                ),
+                text: system_prompt,
             }],
         }],
         messages: vec![Message::text(Role::User, context)],
         output: OutputParams {
             max_output_tokens: Some(MAX_OUTPUT_TOKENS),
-            response_format: Some(response_format()),
+            response_format: Some(response_format),
             ..OutputParams::default()
         },
         ..LlmRequest::default()
@@ -391,26 +447,15 @@ fn llm_request(target: &ModelId, context: String) -> Request {
     }
 }
 
-fn response_format() -> Value {
-    json!({
-        "type": "json_schema",
-        "json_schema": {
-            "name": "switchyard_privacy_verdict",
-            "strict": true,
-            "schema": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "clear_score": { "type": "number", "minimum": 0, "maximum": 1 },
-                    "reason_code": {
-                        "type": "string",
-                        "enum": PrivacyVerdict::ALL.map(PrivacyVerdict::as_str)
-                    }
-                },
-                "required": ["clear_score", "reason_code"]
-            }
-        }
-    })
+fn strip_json_fence(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("```") else {
+        return text;
+    };
+    let rest = rest.strip_prefix("json").unwrap_or(rest);
+    rest.trim_start_matches(['\n', '\r'])
+        .strip_suffix("```")
+        .map(str::trim)
+        .unwrap_or(rest)
 }
 
 #[cfg(test)]
@@ -509,6 +554,8 @@ mod tests {
         SemanticPrivacyClassifier::llm(
             "privacy/model".into(),
             Arc::new(LlmReplyClient(Mutex::new(Some(reply)))),
+            None,
+            ClassifierResponseFormat::JsonSchema,
             0.9,
         )
     }
@@ -638,20 +685,47 @@ mod tests {
                 .contains("normalized_marker")
         );
 
-        let classifier_request = llm_request(&"privacy/model".into(), encoded);
-        let llm = &classifier_request.llm_request;
-        assert_eq!(llm.model.as_deref(), Some("privacy/model"));
-        assert_eq!(
-            llm.extensions.fields.get("store"),
-            Some(&Value::Bool(false))
-        );
-        assert!(llm.output.response_format.is_some());
-        assert!(llm.instructions[0].content.iter().any(
-            |block| matches!(block, ContentBlock::Text { text } if text.contains("clear_score"))
-        ));
-        assert!(!llm.stream);
-        assert!(classifier_request.raw_request.is_none());
-        assert!(classifier_request.metadata.is_none());
+        for (format, expected_response_format) in [
+            (
+                ClassifierResponseFormat::JsonSchema,
+                json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "switchyard_privacy_verdict",
+                        "strict": true,
+                        "schema": verdict_schema(),
+                    }
+                }),
+            ),
+            (
+                ClassifierResponseFormat::JsonObject,
+                json!({"type": "json_object"}),
+            ),
+        ] {
+            let classifier_request = llm_request(
+                &"privacy/model".into(),
+                encoded.clone(),
+                Some("custom privacy prompt"),
+                format,
+            );
+            let llm = &classifier_request.llm_request;
+            assert_eq!(llm.model.as_deref(), Some("privacy/model"));
+            assert_eq!(
+                llm.extensions.fields.get("store"),
+                Some(&Value::Bool(false))
+            );
+            assert_eq!(llm.output.response_format, Some(expected_response_format));
+            assert!(llm.instructions[0].content.iter().any(
+                |block| matches!(block, ContentBlock::Text { text }
+                    if text.starts_with("custom privacy prompt\n\n")
+                        && PrivacyVerdict::ALL
+                            .iter()
+                            .all(|verdict| text.contains(verdict.as_str())))
+            ));
+            assert!(!llm.stream);
+            assert!(classifier_request.raw_request.is_none());
+            assert!(classifier_request.metadata.is_none());
+        }
 
         request.llm_request.messages = vec![Message::text(
             switchyard_protocol::Role::User,
@@ -729,6 +803,14 @@ mod tests {
             (
                 Ok(llm_response(
                     r#"{"clear_score":0.95,"reason_code":"no_sensitive_content"}"#,
+                )),
+                PrivacyLane::Standard,
+                "no_sensitive_content",
+                Some(0.95),
+            ),
+            (
+                Ok(llm_response(
+                    "```json\n{\"clear_score\":0.95,\"reason_code\":\"no_sensitive_content\"}\n```",
                 )),
                 PrivacyLane::Standard,
                 "no_sensitive_content",
