@@ -341,22 +341,31 @@ impl Route {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use libsy::{Driver, Passthrough};
     use reqwest::StatusCode;
-    use switchyard_protocol::{Category, LlmResponse, RoutedLlmClient, text_response};
+    use switchyard_protocol::{
+        Category, DecisionRequest, DecisionResponse, LlmResponse, RoutedDecisionClient,
+        RoutedLlmClient, text_response,
+    };
 
     use super::*;
     use crate::privacy::mark_privacy_restricted;
 
-    struct JudgeThenRoute;
+    enum RoutingCall {
+        Llm,
+        Decision,
+    }
+
+    struct CallThenRoute(RoutingCall);
 
     #[async_trait::async_trait]
-    impl Algorithm for JudgeThenRoute {
+    impl Algorithm for CallThenRoute {
         fn name(&self) -> &str {
-            "judge_then_route"
+            "call_then_route"
         }
 
         async fn route(
@@ -364,12 +373,29 @@ mod tests {
             driver: Driver,
             request: Request,
         ) -> libsy::Result<RoutingOutcome> {
-            driver
-                .call_model(
-                    request.clone(),
-                    driver.models_for(&Category::Judge).to_vec(),
-                )
-                .await?;
+            match &self.0 {
+                RoutingCall::Llm => {
+                    driver
+                        .call_model(
+                            request.clone(),
+                            driver.models_for(&Category::Judge).to_vec(),
+                        )
+                        .await?;
+                }
+                RoutingCall::Decision => {
+                    let judge = driver.first_model_for(&Category::Judge)?.clone();
+                    driver
+                        .call_decision(
+                            DecisionRequest {
+                                model: None,
+                                context: Value::Null,
+                                questions: BTreeMap::new(),
+                            },
+                            judge,
+                        )
+                        .await?;
+                }
+            }
             let (selected, fallbacks) = driver
                 .models_for(&Category::Any)
                 .split_first()
@@ -385,6 +411,8 @@ mod tests {
     struct RecordingClient {
         calls: Arc<Mutex<Vec<ModelId>>>,
     }
+
+    struct CountingDecisionClient(Arc<AtomicUsize>);
 
     #[async_trait::async_trait]
     impl RoutedLlmClient for RecordingClient {
@@ -405,6 +433,22 @@ mod tests {
                 llm_response: LlmResponse::Agg(text_response(Some(model.to_string()), "ok")),
                 metadata: None,
                 upstream_headers: Default::default(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RoutedDecisionClient for CountingDecisionClient {
+        async fn call(
+            &self,
+            _request: DecisionRequest,
+        ) -> Result<DecisionResponse, LlmClientError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(DecisionResponse {
+                id: None,
+                model: None,
+                answers: BTreeMap::new(),
+                usage: Default::default(),
             })
         }
     }
@@ -443,6 +487,16 @@ mod tests {
         request
     }
 
+    fn decision_target(target: &str, model: &ModelId) -> DecisionTarget {
+        DecisionTarget {
+            target: target.to_string(),
+            model: model.clone(),
+            format: WireFormat::OpenAiChat,
+            base_url: format!("https://{target}.example/v1"),
+            extra_body: BTreeMap::new(),
+        }
+    }
+
     #[tokio::test]
     async fn privacy_restricted_lane_covers_judge_fallbacks_and_auxiliary_calls() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -459,7 +513,7 @@ mod tests {
             "standard-auxiliary",
         );
         let restricted = lane(
-            Arc::new(JudgeThenRoute),
+            Arc::new(CallThenRoute(RoutingCall::Llm)),
             client,
             RuntimeModels::new(HashMap::from([
                 (Category::Judge, vec!["restricted-judge".into()]),
@@ -501,6 +555,61 @@ mod tests {
         assert!(
             error.to_string().contains("restricted-auxiliary"),
             "{error}"
+        );
+    }
+    #[tokio::test]
+    async fn restricted_typed_decision_resolves_restricted_target_metadata() {
+        let answer: ModelId = "shared-model".into();
+        let llm: Arc<dyn RoutedLlmClient> = Arc::new(RecordingClient {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let mut standard = lane(
+            Arc::new(Passthrough),
+            Arc::clone(&llm),
+            RuntimeModels::new(HashMap::from([(Category::Any, vec![answer.clone()])])),
+            "standard-auxiliary",
+        );
+        standard.decision_targets = vec![decision_target("standard", &answer)];
+
+        let judge: ModelId = "restricted-decision".into();
+        let decision_calls = Arc::new(AtomicUsize::new(0));
+        let restricted = ExecutionLane::new(
+            Arc::new(CallThenRoute(RoutingCall::Decision)),
+            ClientRouter::single_with_decision_clients(
+                llm,
+                HashMap::from([(
+                    judge.clone(),
+                    Arc::new(CountingDecisionClient(Arc::clone(&decision_calls)))
+                        as Arc<dyn RoutedDecisionClient>,
+                )]),
+            ),
+            None,
+            None,
+            vec![decision_target("restricted", &answer)],
+            RuntimeModels::new(HashMap::from([
+                (Category::Judge, vec![judge]),
+                (Category::Any, vec![answer]),
+            ])),
+        );
+        let route = Route::from_lane(standard, None, ModelCapabilities::default())
+            .with_privacy(PrivacyPolicy::new(true), restricted);
+        let route_id: ModelId = "switchyard/private".into();
+        let runner = crate::Runner::new(vec![(route_id.clone(), route)]);
+
+        let outcome = runner
+            .route(route_id.as_str())
+            .expect("route")
+            .decide(restricted_request())
+            .await
+            .expect("restricted decision");
+        assert_eq!(decision_calls.load(Ordering::Relaxed), 1);
+        let description = runner
+            .describe_decision(&route_id, &outcome)
+            .expect("restricted target metadata");
+        assert_eq!(description.selected.target, "restricted");
+        assert_eq!(
+            description.selected.base_url,
+            "https://restricted.example/v1"
         );
     }
 }
