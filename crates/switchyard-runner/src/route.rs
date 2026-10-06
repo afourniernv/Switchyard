@@ -217,8 +217,12 @@ impl Route {
             return Ok((&self.standard, None));
         };
         validate_mixed_request(request)?;
-        let decision = privacy.policy.decide(request).await?;
+        let route = request.llm_request.model.as_deref().unwrap_or_default();
+        let algorithm = self.algorithm_name();
+        let decision = privacy.policy.decide(request, route, algorithm).await?;
         tracing::debug!(
+            switchyard.route = route,
+            switchyard.algorithm = algorithm,
             privacy.lane = decision.lane.as_str(),
             privacy.source = decision.source.as_str(),
             privacy.reason_code = decision.reason_code,
