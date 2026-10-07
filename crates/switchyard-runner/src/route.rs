@@ -593,8 +593,10 @@ mod tests {
                 (Category::Any, vec![answer]),
             ])),
         );
-        let route = Route::from_lane(standard, None, ModelCapabilities::default())
-            .with_privacy(PrivacyPolicy::new(true), restricted);
+        let route = Route::from_lane(standard, None, ModelCapabilities::default()).with_privacy(
+            PrivacyPolicy::new(true, None).expect("empty detector configuration should compile"),
+            restricted,
+        );
         let route_id: ModelId = "switchyard/private".into();
         let runner = crate::Runner::new(vec![(route_id.clone(), route)]);
 
