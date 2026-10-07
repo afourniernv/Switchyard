@@ -7,11 +7,13 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{Map, Value};
 use strum_macros::{EnumString, IntoStaticStr};
 use switchyard_protocol::{
     ChoiceOption, DecisionKind, DecisionQuestion, DecisionRequest, DecisionResponse, DecisionValue,
-    ModelId, Request, RoutedDecisionClient,
+    FormatId, InstructionBlock, LlmRequest, Message, ModelId, OutputParams, PreservationMetadata,
+    ProviderExtensions, ReasoningParams, Request, RoutedDecisionClient, ToolChoice, ToolDefinition,
 };
 
 use super::{PrivacyDecision, PrivacyLane};
@@ -53,7 +55,7 @@ impl SemanticPrivacyClassifier {
     }
 
     fn request(&self, request: &Request) -> Result<DecisionRequest, ()> {
-        let context = serialize_classifier_context(request)?;
+        let context = serialize_classifier_context(&request.llm_request)?;
         Ok(DecisionRequest {
             model: Some(self.target.clone()),
             context,
@@ -125,10 +127,64 @@ impl SemanticPrivacyClassifier {
     }
 }
 
-fn serialize_classifier_context(request: &Request) -> Result<Value, ()> {
+fn serialize_classifier_context(request: &LlmRequest) -> Result<Value, ()> {
     let mut json = BoundedJson::default();
-    serde_json::to_writer(&mut json, &request.llm_request).map_err(|_| ())?;
+    serde_json::to_writer(&mut json, &PrivacyClassifierContext::new(request)).map_err(|_| ())?;
     json.into_value()
+}
+
+#[derive(Serialize)]
+struct PrivacyClassifierContext<'a> {
+    instructions: &'a [InstructionBlock],
+    messages: &'a [Message],
+    tools: &'a [ToolDefinition],
+    tool_choice: Option<&'a ToolChoice>,
+    response_format: Option<&'a Value>,
+    reasoning_effort: Option<&'a str>,
+    reasoning_raw: Option<&'a Value>,
+    extensions: &'a Map<String, Value>,
+    preserved_requests: &'a BTreeMap<FormatId, Value>,
+}
+
+impl<'a> PrivacyClassifierContext<'a> {
+    fn new(request: &'a LlmRequest) -> Self {
+        // Keep this exhaustive so each new protocol field gets an explicit privacy decision.
+        let LlmRequest {
+            model: _,
+            instructions,
+            messages,
+            tools,
+            tool_choice,
+            sampling: _,
+            output,
+            reasoning,
+            stream: _,
+            extensions,
+            preservation,
+        } = request;
+        let OutputParams {
+            max_output_tokens: _,
+            response_format,
+            is_schema_enforced: _,
+        } = output;
+        let ReasoningParams { effort, raw } = reasoning;
+        let ProviderExtensions { fields: extensions } = extensions;
+        let PreservationMetadata {
+            requests: preserved_requests,
+            responses: _,
+        } = preservation;
+        Self {
+            instructions,
+            messages,
+            tools,
+            tool_choice: tool_choice.as_ref(),
+            response_format: response_format.as_ref(),
+            reasoning_effort: effort.as_deref(),
+            reasoning_raw: raw.as_ref(),
+            extensions,
+            preserved_requests,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -287,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn context_is_bounded_and_covers_outbound_request_state() {
+    fn context_is_bounded_and_covers_privacy_relevant_request_state() {
         let instructions = json!({"policy": "custom"});
         assert_eq!(
             privacy_question(Some(&instructions)).instructions,
@@ -331,12 +387,27 @@ mod tests {
             parameters: json!({}),
             strict: None,
         });
+        request.llm_request.tool_choice = Some(ToolChoice::Raw(json!({"choice_marker": true})));
+        request.llm_request.output.response_format = Some(json!({"format_marker": true}));
+        request.llm_request.reasoning.effort = Some("effort_marker".into());
+        request.llm_request.reasoning.raw = Some(json!({"reasoning_raw_marker": true}));
+        request
+            .llm_request
+            .extensions
+            .fields
+            .insert("extension_marker".into(), Value::Bool(true));
         request
             .llm_request
             .preservation
             .requests
             .insert("openai_chat".into(), json!({"preserved_marker": true}));
-        request.raw_request = Some(json!({"raw_marker": true}));
+        request
+            .llm_request
+            .preservation
+            .responses
+            .insert("openai_chat".into(), json!({"response_marker": true}));
+        request.llm_request.model = Some("model_marker".into());
+        request.raw_request = Some(json!({"request_envelope_marker": true}));
         request
             .metadata
             .get_or_insert_default()
@@ -346,17 +417,32 @@ mod tests {
 
         let decision = classifier.request(&request).expect("bounded context");
         let encoded = decision.context.to_string();
-        assert!(encoded.contains("normalized_marker"));
-        assert!(encoded.contains("reasoning_marker"));
-        assert!(encoded.contains("tool_call_marker"));
-        assert!(encoded.contains("argument_marker"));
-        assert!(encoded.contains("result_marker"));
-        assert!(encoded.contains("signature_marker"));
-        assert!(encoded.contains("provider_detail_marker"));
-        assert!(encoded.contains("tool_definition_marker"));
-        assert!(encoded.contains("preserved_marker"));
-        assert!(!encoded.contains("raw_marker"));
-        assert!(!encoded.contains("metadata_marker"));
+        for marker in [
+            "normalized_marker",
+            "reasoning_marker",
+            "tool_call_marker",
+            "argument_marker",
+            "result_marker",
+            "signature_marker",
+            "provider_detail_marker",
+            "tool_definition_marker",
+            "choice_marker",
+            "format_marker",
+            "effort_marker",
+            "reasoning_raw_marker",
+            "extension_marker",
+            "preserved_marker",
+        ] {
+            assert!(encoded.contains(marker), "missing {marker}");
+        }
+        for marker in [
+            "response_marker",
+            "model_marker",
+            "request_envelope_marker",
+            "metadata_marker",
+        ] {
+            assert!(!encoded.contains(marker), "unexpected {marker}");
+        }
 
         request.llm_request.messages = vec![Message::text(
             switchyard_protocol::Role::User,
