@@ -92,8 +92,8 @@ impl SemanticPrivacyClassifier {
     }
 
     async fn verdict(&self, request: &Request) -> Result<SemanticVerdict, &'static str> {
-        let context = serialize_classifier_context(&request.llm_request)
-            .map_err(|()| "input_unavailable")?;
+        let context =
+            serialize_classifier_context(&request.llm_request).map_err(|()| "input_unavailable")?;
         match &self.backend {
             SemanticBackend::Decision {
                 target,

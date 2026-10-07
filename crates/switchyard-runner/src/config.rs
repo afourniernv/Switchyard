@@ -103,7 +103,7 @@ struct PrivacyClassifierConfig {
     response_format_type: Option<ClassifierResponseFormat>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PrivacyClassifierKind {
     #[default]
@@ -451,7 +451,7 @@ impl DeploymentConfig {
                 classifier.clear_threshold
             )));
         }
-        let classifier = match classifier.kind {
+        let classifier = match &classifier.kind {
             PrivacyClassifierKind::Decision => {
                 if classifier.prompt.is_some() || classifier.response_format_type.is_some() {
                     return Err(RunnerError::configuration(format!(
