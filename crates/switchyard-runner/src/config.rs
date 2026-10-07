@@ -397,7 +397,7 @@ impl DeploymentConfig {
         let classifier = self.build_privacy_classifier(
             route_name,
             config.classifier.as_ref(),
-            standard_decision,
+            standard_decision_target,
             decision_clients,
         )?;
         let (restricted, _) = self.build_lane(
