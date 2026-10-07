@@ -16,7 +16,7 @@ use switchyard_protocol::{
 
 use super::{PrivacyDecision, PrivacyLane};
 
-const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_PRIVACY_CLASSIFIER_CONTEXT_BYTES: usize = 64 * 1024;
 const PROBABILITY_SUM_TOLERANCE: f64 = 1e-6;
 const QUESTION_ID: &str = "privacy";
 
@@ -53,7 +53,7 @@ impl SemanticPrivacyClassifier {
     }
 
     fn request(&self, request: &Request) -> Result<DecisionRequest, ()> {
-        let context = semantic_context(request)?;
+        let context = serialize_classifier_context(request)?;
         Ok(DecisionRequest {
             model: Some(self.target.clone()),
             context,
@@ -125,7 +125,7 @@ impl SemanticPrivacyClassifier {
     }
 }
 
-fn semantic_context(request: &Request) -> Result<Value, ()> {
+fn serialize_classifier_context(request: &Request) -> Result<Value, ()> {
     let mut json = BoundedJson::default();
     serde_json::to_writer(&mut json, &request.llm_request).map_err(|_| ())?;
     json.into_value()
@@ -142,7 +142,7 @@ impl BoundedJson {
 
 impl Write for BoundedJson {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_CONTEXT_BYTES.saturating_sub(self.0.len()) {
+        if bytes.len() > MAX_PRIVACY_CLASSIFIER_CONTEXT_BYTES.saturating_sub(self.0.len()) {
             return Err(io::Error::other("privacy classifier context exceeds limit"));
         }
         self.0.extend_from_slice(bytes);
@@ -360,7 +360,7 @@ mod tests {
 
         request.llm_request.messages = vec![Message::text(
             switchyard_protocol::Role::User,
-            "x".repeat(MAX_CONTEXT_BYTES),
+            "x".repeat(MAX_PRIVACY_CLASSIFIER_CONTEXT_BYTES),
         )];
         assert!(classifier.request(&request).is_err());
     }
