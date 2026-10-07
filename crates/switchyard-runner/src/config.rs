@@ -93,7 +93,7 @@ struct PrivacyConfig {
     accept_external_signal: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RestrictionScope {
     #[default]
@@ -431,7 +431,7 @@ impl DeploymentConfig {
                 error,
             )
         })?;
-        if matches!(config.restriction_scope, RestrictionScope::Task) {
+        if matches!(&config.restriction_scope, RestrictionScope::Task) {
             policy = policy.with_task_retention();
         }
         let (restricted, _) = self.build_lane(
