@@ -305,19 +305,19 @@ impl DeploymentConfig {
     fn build_privacy(
         &self,
         route_name: &str,
-        route: &RouteConfig,
-        standard: &LaneTargets<'_>,
-        clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
+        route_config: &RouteConfig,
+        standard_targets: &LaneTargets<'_>,
+        llm_clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
     ) -> RunnerResult<Option<BuiltPrivacy>> {
-        let Some(config) = &route.privacy else {
+        let Some(config) = &route_config.privacy else {
             return Ok(None);
         };
-        if route.algorithm.decision_judge().is_some() {
+        if route_config.algorithm.decision_judge().is_some() {
             return Err(RunnerError::configuration(format!(
                 "route {route_name} cannot combine privacy with a typed decision judge"
             )));
         }
-        if !route.algorithm.supports_privacy_lanes() {
+        if !route_config.algorithm.supports_privacy_lanes() {
             return Err(RunnerError::configuration(format!(
                 "route {route_name} cannot use privacy with prefill_router"
             )));
@@ -328,14 +328,19 @@ impl DeploymentConfig {
             )));
         }
         let restricted_targets =
-            self.resolve_lane_targets(route_name, route, Some(&config.restricted_targets))?;
-        if self.uses_forward_auth(standard) || self.uses_forward_auth(&restricted_targets) {
+            self.resolve_lane_targets(route_name, route_config, Some(&config.restricted_targets))?;
+        if self.uses_forward_auth(standard_targets) || self.uses_forward_auth(&restricted_targets) {
             return Err(RunnerError::configuration(format!(
                 "route {route_name} cannot use privacy with forward_auth"
             )));
         }
-        let (restricted, _) =
-            self.build_lane(route_name, route, &restricted_targets, None, clients)?;
+        let (restricted, _) = self.build_lane(
+            route_name,
+            route_config,
+            &restricted_targets,
+            None,
+            llm_clients,
+        )?;
         Ok(Some(BuiltPrivacy {
             policy: PrivacyPolicy::new(config.accept_external_signal),
             restricted,
