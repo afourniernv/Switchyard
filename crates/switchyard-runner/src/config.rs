@@ -696,6 +696,9 @@ impl DeploymentConfig {
         if let Some(subagent) = names.subagent {
             models = models.with_subagent(resolve_category_models(subagent, &model_ids)?);
         }
+        if route.privacy.is_some() {
+            models = models.with_target_restriction();
+        }
         Ok((
             ExecutionLane::new(
                 algorithm,
