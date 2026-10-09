@@ -553,6 +553,12 @@ impl DeploymentConfig {
                     classifier.response_format_type.unwrap_or_default(),
                     classifier.clear_threshold,
                 )
+                .map_err(|error| {
+                    RunnerError::configuration_source(
+                        format!("route {route_name} privacy classifier could not be built"),
+                        error,
+                    )
+                })?
             }
         };
         Ok(Some(classifier))
