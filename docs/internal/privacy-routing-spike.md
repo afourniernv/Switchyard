@@ -1,59 +1,38 @@
 # Privacy routing spike
 
-This spike lets an application restrict the models Switchyard may call while keeping its
-existing routing algorithm. Libsy checks the allowed model IDs. Runner chooses the matching
-clients, judges, fallbacks, and auxiliary targets.
+This spike lets an application restrict which configured targets Switchyard may call. It does
+not add a routing algorithm. The target flag and configuration below are proposed, not released.
 
-External restriction works without model-based detection. Semantic assessment is optional.
-Whether Switchyard should maintain privacy categories and classifier prompts remains
-a team decision. This branch demonstrates the implementation; it is not a released API.
+`private = true` means the deployment owner approves that target for restricted requests.
+It does not detect sensitive content, verify the endpoint, or prevent a provider from retaining
+data. Targets default to `private = false`.
 
-## Responsibilities
+## Target approval and an external signal
 
-| Component | Responsibility |
-|---|---|
-| Embedded application | Supply an external restriction and trusted task identity, if needed. |
-| Libsy | Check declared targets; build and validate optional semantic judge calls. |
-| Runner | Choose the lane, its clients and auxiliaries; apply thresholds and task retention. |
-| LLM client | Execute provider requests, retries, and candidate fallbacks. |
-
-The semantic adapter reuses libsy's private structured judge contract, request builder, decoder,
-and `Driver`. It does not expose those private helpers or replace the existing router.
-
-```mermaid
-flowchart TD
-    R[Request] --> T{Task already restricted?}
-    T -->|Yes| P[Restricted lane and clients]
-    T -->|No| C[External signal and optional semantic assessment]
-    C -->|Clear| S[Standard lane and clients]
-    C -->|Sensitive or indeterminate| P
-    S --> A[Configured routing algorithm]
-    P --> B[Separate instance of the same algorithm]
-    A --> SM[Standard judges, answers, fallbacks and auxiliaries]
-    B --> PM[Restricted judges, answers, fallbacks and auxiliaries]
-```
-
-## External classification only
-
-These examples assume the named targets are declared in the deployment. The host decides
-whether a request needs restricted targets. No detector or classifier runs in this example.
+Declare the targets normally and flag the approved ones. The route lists its usual candidates;
+there is no replacement-target map. Client definitions are omitted here.
 
 ```toml
+[targets.fast]
+id = "public-model"
+llm_client = "public_endpoint"
+
+[targets.internal]
+id = "internal-model"
+llm_client = "internal_endpoint"
+private = true
+
 [routes.coding]
 id = "switchyard/coding"
-type = "stage_router"
-efficient_target = "fast"
-capable_target = "capable"
-picker = "efficient_first"
-confidence_threshold = 0.60
+type = "random"
+targets = ["fast", "internal"]
+weights = [3, 1]
 
 [routes.coding.privacy]
 accept_external_signal = true
-
-[routes.coding.privacy.restricted_targets]
-fast = "private_fast"
-capable = "private_capable"
 ```
+
+The embedded application decides whether this request needs private targets:
 
 ```rust
 use switchyard_runner::mark_privacy_restricted;
@@ -64,43 +43,90 @@ if requires_restricted_targets {
 let output = route.execute(request, None).await?;
 ```
 
-This is a trusted in-process signal, not an HTTP header. A marked request fails if the route
-has not enabled external signals. An unmarked request can still be restricted by other checks.
+Unmarked requests use both configured candidates. Marked requests can use only `internal`,
+including after a failed attempt. Random keeps the weights paired with their targets when
+filtering. No detector or classifier runs in this example.
+
+The signal is trusted, in-process Rust state, not an HTTP header or a Python binding. A marked
+request fails if the route has not enabled external signals. An unmarked request can still be
+restricted by an optional semantic check.
+
+```mermaid
+flowchart TD
+    R[Request] --> T{Task already restricted?}
+    T -->|Yes| P[Configured targets flagged private]
+    T -->|No| C[External signal and optional semantic assessment]
+    C -->|Clear| S[All configured targets]
+    C -->|Sensitive or indeterminate| P
+    S --> A[Configured routing algorithm]
+    P --> B[Separate instance of the same algorithm]
+    A --> SM[Standard judges, answers, fallbacks and auxiliaries]
+    B --> PM[Private judges, answers, fallbacks and auxiliaries]
+```
+
+Filtering never imports another deployment's targets or silently changes a target's role.
+Configurations fail to load if the remaining targets cannot support the chosen router.
+
+Stage, Escalation and other fixed-role routers still need their required efficient, capable
+and judge targets. A Stage route with a public efficient target and a private capable target
+therefore cannot enable this policy: filtering would remove a required role. This spike does
+not silently turn Stage into passthrough. Custom classifier pools can contain public and private
+targets; their required groups must remain usable after filtering.
 
 ## Always-private workload
 
 Use an ordinary route containing only approved targets. It does not need classification or a
-second lane. Stage still makes its normal efficient/capable choice.
+second lane. Flag both targets `private = true`; Stage still makes its normal tier choice.
 
 ```toml
+[targets.internal_fast]
+id = "internal-small-model"
+llm_client = "internal_endpoint"
+private = true
+
+[targets.internal_capable]
+id = "internal-large-model"
+llm_client = "internal_endpoint"
+private = true
+
 [routes.private_coding]
 id = "switchyard/private-coding"
 type = "stage_router"
-efficient_target = "private_fast"
-capable_target = "private_capable"
+efficient_target = "internal_fast"
+capable_target = "internal_capable"
 picker = "efficient_first"
 confidence_threshold = 0.60
 ```
 
 ## Optional semantic assessment
 
-Add one classifier to the mixed route. A generic LLM target and a typed decision target are
-alternatives, not consecutive judges. The classifier endpoint must be approved for all content
-entering the route because it sees that content before lane selection.
+Add one classifier to the mixed route. Generic LLM and typed decision models are alternatives,
+not consecutive judges. Both require a target flagged `private = true`: the classifier receives
+the content before deciding which targets may answer.
 
 ```toml
+[targets.privacy_classifier]
+id = "internal-classifier"
+llm_client = "internal_endpoint"
+private = true
+
 [routes.coding.privacy.classifier]
 type = "llm"
-target = "privacy_classifier" # An entry in targets.
+target = "privacy_classifier"
 clear_threshold = 0.90
 response_format_type = "json_schema"
 # prompt = "Your policy instructions."
 ```
 
 ```toml
+[decision_targets.privacy_decision]
+id = "internal-decision-model"
+decision_client = "internal_decisions"
+private = true
+
 [routes.coding.privacy.classifier]
 type = "decision"
-target = "privacy_decision" # An entry in decision_targets.
+target = "privacy_decision"
 clear_threshold = 0.90
 # instructions = { policy = "Your policy instructions." }
 ```
@@ -113,6 +139,10 @@ metadata and cached responses. The serialized input is bounded to 64 KiB. Invali
 oversized input, uncertainty, low clear scores and failed calls restrict the current request.
 `clear_score` is a model score, not a calibrated guarantee of safety.
 
+The semantic adapter reuses libsy's private judge contract, request builder, decoder and
+`Driver`. Built-in pattern detectors are not included. Ownership of privacy categories and
+classifier prompts remains a team decision.
+
 ## Task retention
 
 Set `restriction_scope = "task"` in the existing privacy table and supply
@@ -123,7 +153,14 @@ next turn.
 Retention is process-local and limited to 4,096 restricted task IDs. There is no expiry, reset
 API or replica coordination. Missing/invalid task IDs and exhausted capacity restrict requests.
 
-## Boundaries and API impact
+## Responsibilities and API impact
+
+| Component | Responsibility |
+|---|---|
+| Embedded application | Supply an external restriction and trusted task identity, if needed. |
+| Libsy | Check allowed model IDs; build and validate optional semantic judge calls. |
+| Runner | Filter configured targets, choose clients and auxiliaries, retain task restrictions. |
+| LLM client | Execute provider requests, retries and candidate fallbacks. |
 
 Direct Rust hosts can use `RuntimeModels::with_target_restriction()` and a matching
 `ClientRouter`. The guard covers `Driver`, the default `run_stream`, and `drive`, including
@@ -135,21 +172,23 @@ The additive prototype APIs are `PrivacyPreflight`, `PrivacyAssessment`, and the
 builder. Existing public signatures and the native plugin ABI are unchanged. No new crate
 dependency is added. Generic judge helpers remain private.
 
-Map every callable target in a mixed route, including judges and fallbacks. A typed routing
-judge also needs `restricted_decision_target`. Mixed routes currently reject forwarded caller
-auth, prefill routing, and OpenAI Responses continuation state. Direct embedded hosts must not
-reuse a broad client router's stored continuation across privacy lanes.
+Target flags are internal configuration fields, not additions to public Rust types. There is
+no `restricted_targets` or `restricted_decision_target` table. A typed routing judge and its
+named candidates must be approved just like other callable targets. Aliases for the same
+model on the same client cannot disagree on the flag.
 
-Built-in pattern detectors and their TOML table have been removed. The remaining inputs are
-external restriction and optional semantic assessment. A `privacy = true` flag could mean
-source opt-in, an always-restricted route, or target approval. This spike does not combine them.
+Mixed routes currently reject forwarded caller auth, prefill routing and OpenAI Responses
+continuation state. Direct embedded hosts must not reuse a broad client router's stored
+continuation across privacy lanes. A private target's provider policy remains the deployment
+owner's responsibility.
 
 ## Validation
 
-Tests cover target enforcement, custom stream overrides, bounded context, malformed verdicts,
-thresholds, task retention and cancellation. The loopback HTTP proof covers both JSON modes,
-same-model deployments, fallback, and 32 runner executions. Synthetic verdicts validate wiring,
-not detector accuracy. No live provider benchmark was rerun for this iteration.
+Focused coverage checks target filtering, positional weights, required roles, classifier
+approval, fallback enforcement and privacy marks on failed requests. Existing tests cover
+bounded context, malformed verdicts, thresholds, task retention and cancellation. Synthetic
+verdicts validate wiring, not classifier accuracy; no live provider benchmark was rerun for
+this configuration change.
 
 Classifier calls now use the standard libsy call spans and metrics. The INFO context span keeps
 route attribution; Relay privacy decision marks are unchanged. Buffered response IDs/models
