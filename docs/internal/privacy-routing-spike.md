@@ -4,8 +4,8 @@ This spike lets an application restrict the models Switchyard may call while kee
 existing routing algorithm. Libsy checks the allowed model IDs. Runner chooses the matching
 clients, judges, fallbacks, and auxiliary targets.
 
-External restriction works without built-in detection. Deterministic and semantic checks are
-optional. Whether Switchyard should maintain privacy categories and detector prompts remains
+External restriction works without model-based detection. Semantic assessment is optional.
+Whether Switchyard should maintain privacy categories and classifier prompts remains
 a team decision. This branch demonstrates the implementation; it is not a released API.
 
 ## Responsibilities
@@ -24,7 +24,7 @@ and `Driver`. It does not expose those private helpers or replace the existing r
 flowchart TD
     R[Request] --> T{Task already restricted?}
     T -->|Yes| P[Restricted lane and clients]
-    T -->|No| C[External signal and optional checks]
+    T -->|No| C[External signal and optional semantic assessment]
     C -->|Clear| S[Standard lane and clients]
     C -->|Sensitive or indeterminate| P
     S --> A[Configured routing algorithm]
@@ -106,21 +106,19 @@ clear_threshold = 0.90
 ```
 
 The generic path supports `json_schema` and `json_object`, with typed local verdict validation.
-Both include the schema in the prompt. The input borrows content-bearing request fields,
-including instructions, tools, extensions and preserved request bodies; it excludes transport
+Both include the schema in the prompt. Structural validation restricts opaque or oversized
+content before classification; it does not detect PII. The input borrows content-bearing request
+fields, including instructions, tools, extensions and preserved request bodies; it excludes transport
 metadata and cached responses. The serialized input is bounded to 64 KiB. Invalid output,
 oversized input, uncertainty, low clear scores and failed calls restrict the current request.
 `clear_score` is a model score, not a calibrated guarantee of safety.
 
-Deterministic checks can also be enabled explicitly with
-`[routes.coding.privacy.deterministic]` and `detectors = ["email", "api_key"]`.
-
 ## Task retention
 
 Set `restriction_scope = "task"` in the existing privacy table and supply
-`request.metadata.task_id`. Only explicit external restriction, a deterministic match, or a
-valid sensitive semantic verdict becomes sticky. A failure, invalid verdict, uncertainty or
-low clear score is reassessed next turn.
+`request.metadata.task_id`. Only explicit external restriction or a valid sensitive semantic
+verdict becomes sticky. A failure, invalid verdict, uncertainty or low clear score is reassessed
+next turn.
 
 Retention is process-local and limited to 4,096 restricted task IDs. There is no expiry, reset
 API or replica coordination. Missing/invalid task IDs and exhausted capacity restrict requests.
@@ -142,9 +140,9 @@ judge also needs `restricted_decision_target`. Mixed routes currently reject for
 auth, prefill routing, and OpenAI Responses continuation state. Direct embedded hosts must not
 reuse a broad client router's stored continuation across privacy lanes.
 
-This iteration leaves the TOML unchanged. A `privacy = true` flag could mean source opt-in,
-an always-restricted route, or target approval. Those are different decisions; this spike does
-not combine them.
+Built-in pattern detectors and their TOML table have been removed. The remaining inputs are
+external restriction and optional semantic assessment. A `privacy = true` flag could mean
+source opt-in, an always-restricted route, or target approval. This spike does not combine them.
 
 ## Validation
 

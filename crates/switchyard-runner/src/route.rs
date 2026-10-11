@@ -368,14 +368,13 @@ mod tests {
     use libsy::{Driver, Passthrough};
     use reqwest::StatusCode;
     use switchyard_protocol::{
-        Category, DecisionAnswer, DecisionRequest, DecisionResponse, DecisionValue, LlmResponse,
-        Message, Probability, Role, RoutedDecisionClient, RoutedLlmClient, Usage, text_response,
+        Category, ContentBlock, DecisionAnswer, DecisionRequest, DecisionResponse, DecisionValue,
+        LlmResponse, Message, Probability, Role, RoutedDecisionClient, RoutedLlmClient, Usage,
+        text_response,
     };
 
     use super::*;
-    use crate::privacy::{
-        DeterministicDetector, SemanticPrivacyClassifier, mark_privacy_restricted,
-    };
+    use crate::privacy::{SemanticPrivacyClassifier, mark_privacy_restricted};
 
     enum RoutingCall {
         Llm,
@@ -570,11 +569,8 @@ mod tests {
             ])),
             "restricted-auxiliary",
         );
-        let route = Route::from_lane(standard, None, ModelCapabilities::default()).with_privacy(
-            PrivacyPolicy::new(true, None, None)
-                .expect("empty detector configuration should compile"),
-            restricted,
-        );
+        let route = Route::from_lane(standard, None, ModelCapabilities::default())
+            .with_privacy(PrivacyPolicy::new(true, None), restricted);
 
         let mut observed = None;
         let output = route
@@ -649,11 +645,8 @@ mod tests {
                 (Category::Any, vec![answer]),
             ])),
         );
-        let route = Route::from_lane(standard, None, ModelCapabilities::default()).with_privacy(
-            PrivacyPolicy::new(true, None, None)
-                .expect("empty detector configuration should compile"),
-            restricted,
-        );
+        let route = Route::from_lane(standard, None, ModelCapabilities::default())
+            .with_privacy(PrivacyPolicy::new(true, None), restricted);
         let route_id: ModelId = "switchyard/private".into();
         let runner = crate::Runner::new(vec![(route_id.clone(), route)]);
 
@@ -675,7 +668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_privacy_runs_after_deterministic_checks() {
+    async fn external_and_input_restrictions_skip_semantic_assessment() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let client: Arc<dyn RoutedLlmClient> = Arc::new(RecordingClient {
             calls: Arc::clone(&calls),
@@ -707,15 +700,8 @@ mod tests {
             None,
             0.9,
         );
-        let route = Route::from_lane(standard, None, ModelCapabilities::default()).with_privacy(
-            PrivacyPolicy::new(
-                true,
-                Some(vec![DeterministicDetector::BearerToken]),
-                Some(classifier),
-            )
-            .expect("static detector configuration should compile"),
-            restricted,
-        );
+        let route = Route::from_lane(standard, None, ModelCapabilities::default())
+            .with_privacy(PrivacyPolicy::new(true, Some(classifier)), restricted);
 
         assert_eq!(
             route
@@ -727,16 +713,28 @@ mod tests {
             "standard-primary"
         );
 
-        let mut sensitive = Request::default();
-        sensitive.llm_request.messages.push(Message::text(
-            Role::User,
-            "Authorization: Bearer abcdefghijklmnop",
-        ));
         assert_eq!(
             route
-                .decide(sensitive)
+                .decide(restricted_request())
                 .await
-                .expect("deterministic restriction")
+                .expect("external restriction")
+                .selected_model_id()
+                .expect("selected model"),
+            "restricted-primary"
+        );
+        let mut opaque = Request::default();
+        opaque.llm_request.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Unknown {
+                provider: "custom".into(),
+                raw: Value::Null,
+            }],
+        });
+        assert_eq!(
+            route
+                .decide(opaque)
+                .await
+                .expect("opaque input restriction")
                 .selected_model_id()
                 .expect("selected model"),
             "restricted-primary"

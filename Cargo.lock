@@ -2526,7 +2526,6 @@ dependencies = [
  "futures-util",
  "parking_lot",
  "prefill-router",
- "regex",
  "reqwest",
  "serde",
  "serde_json",

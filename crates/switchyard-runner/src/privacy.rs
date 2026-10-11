@@ -3,7 +3,7 @@
 
 //! Privacy policy used to select a route's execution lane.
 
-mod deterministic;
+mod input;
 mod semantic;
 
 use std::collections::HashSet;
@@ -14,8 +14,7 @@ use strum_macros::{EnumString, IntoStaticStr};
 use switchyard_protocol::{LlmClientError, Request, WireFormat};
 
 const EXTERNAL_RESTRICTION_KEY: &str = "switchyard.internal.external_privacy_restriction";
-pub(crate) use deterministic::DeterministicDetector;
-use deterministic::{Assessment, Inspector};
+use input::validate_input;
 pub(crate) use semantic::SemanticPrivacyClassifier;
 pub(crate) const SELECTED_LANE_KEY: &str = "switchyard.internal.privacy_lane";
 const MAX_TASK_ID_BYTES: usize = 512;
@@ -24,7 +23,6 @@ const RESPONSES_STATE_FIELDS: [&str; 2] = ["previous_response_id", "conversation
 
 pub(crate) struct PrivacyPolicy {
     accept_external_signal: bool,
-    inspector: Option<Inspector>,
     classifier: Option<SemanticPrivacyClassifier>,
     task_restrictions: Option<TaskRestrictions>,
 }
@@ -83,7 +81,6 @@ pub struct PrivacyDecision {
 pub(crate) enum PrivacySource {
     Policy,
     ExternalSignal,
-    Deterministic,
     SemanticClassifier,
     TaskRetention,
 }
@@ -198,20 +195,13 @@ pub(crate) fn external_signal_not_accepted() -> LlmClientError {
 impl PrivacyPolicy {
     pub(crate) fn new(
         accept_external_signal: bool,
-        detectors: Option<Vec<DeterministicDetector>>,
         classifier: Option<SemanticPrivacyClassifier>,
-    ) -> Result<Self, regex::Error> {
-        let inspector = match detectors {
-            Some(detectors) => Some(Inspector::new(detectors)?),
-            None if classifier.is_some() => Some(Inspector::structural()),
-            None => None,
-        };
-        Ok(Self {
+    ) -> Self {
+        Self {
             accept_external_signal,
-            inspector,
             classifier,
             task_restrictions: None,
-        })
+        }
     }
 
     pub(crate) fn with_task_retention(mut self) -> Self {
@@ -257,29 +247,17 @@ impl PrivacyPolicy {
             )
             .retained_for_task());
         }
-        if let Some(inspector) = &self.inspector {
-            match inspector.inspect(request) {
-                Assessment::Restricted(reason_code) => {
-                    return Ok(PrivacyDecision::new(
-                        PrivacyLane::Restricted,
-                        PrivacySource::Deterministic,
-                        reason_code,
-                    )
-                    .retained_for_task());
-                }
-                Assessment::Indeterminate(reason_code) => {
+        Ok(match &self.classifier {
+            Some(classifier) => {
+                if let Err(reason_code) = validate_input(request) {
                     return Ok(PrivacyDecision::new(
                         PrivacyLane::Restricted,
                         PrivacySource::Policy,
                         reason_code,
                     ));
                 }
-                Assessment::Clear => {}
+                classifier.assess(request, route, algorithm).await
             }
-        }
-
-        Ok(match &self.classifier {
-            Some(classifier) => classifier.assess(request, route, algorithm).await,
             None => PrivacyDecision::all_clear(),
         })
     }
@@ -372,16 +350,14 @@ mod tests {
         mark_privacy_restricted(&mut request);
 
         assert!(
-            PrivacyPolicy::new(false, None, None)
-                .expect("empty detector configuration should compile")
+            PrivacyPolicy::new(false, None)
                 .with_task_retention()
                 .decide(&request, "test/route", "test_algorithm")
                 .await
                 .is_err()
         );
         assert!(matches!(
-            PrivacyPolicy::new(true, None, None)
-                .expect("empty detector configuration should compile")
+            PrivacyPolicy::new(true, None)
                 .decide(&request, "test/route", "test_algorithm")
                 .await,
             Ok(PrivacyDecision {
@@ -398,32 +374,11 @@ mod tests {
                 raw: Value::Null,
             }],
         });
-        let decision = PrivacyPolicy::new(true, None, None)
-            .expect("empty detector configuration should compile")
+        let decision = PrivacyPolicy::new(true, None)
             .decide(&opaque, "test/route", "test_algorithm")
             .await
             .expect("unmarked request should remain valid");
         assert!(matches!(decision.lane, PrivacyLane::Standard));
-    }
-
-    #[tokio::test]
-    async fn deterministic_inspection_fails_closed_on_opaque_content() {
-        let mut request = Request::default();
-        request.llm_request.messages.push(Message {
-            role: Role::User,
-            content: vec![ContentBlock::Unknown {
-                provider: "custom".into(),
-                raw: Value::Null,
-            }],
-        });
-
-        let decision = PrivacyPolicy::new(false, Some(vec![DeterministicDetector::Email]), None)
-            .expect("static detector patterns should compile")
-            .decide(&request, "test/route", "test_algorithm")
-            .await
-            .expect("opaque content should select a lane");
-        assert!(matches!(decision.lane, PrivacyLane::Restricted));
-        assert_eq!(decision.reason_code, "opaque_content");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use switchyard_llm_client::{
 };
 use switchyard_protocol::{Category, ModelId, RoutedDecisionClient, RoutedLlmClient, WireFormat};
 
-use crate::privacy::{DeterministicDetector, PrivacyPolicy, SemanticPrivacyClassifier};
+use crate::privacy::{PrivacyPolicy, SemanticPrivacyClassifier};
 use crate::route::ExecutionLane;
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
@@ -87,7 +87,6 @@ struct PrivacyConfig {
     restricted_decision_target: Option<String>,
     #[serde(default)]
     restriction_scope: RestrictionScope,
-    deterministic: Option<DeterministicConfig>,
     classifier: Option<PrivacyClassifierConfig>,
     #[serde(default)]
     accept_external_signal: bool,
@@ -119,24 +118,6 @@ enum PrivacyClassifierKind {
     #[default]
     Decision,
     Llm,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeterministicConfig {
-    #[serde(default)]
-    detectors: BTreeSet<DeterministicDetector>,
-}
-
-impl DeterministicConfig {
-    fn build(&self, route_name: &str) -> RunnerResult<Vec<DeterministicDetector>> {
-        if self.detectors.is_empty() {
-            return Err(RunnerError::configuration(format!(
-                "route {route_name} privacy deterministic must configure at least one detector"
-            )));
-        }
-        Ok(self.detectors.iter().copied().collect())
-    }
 }
 
 struct TargetPromptPolicy {
@@ -377,19 +358,11 @@ impl DeploymentConfig {
                 "route {route_name} cannot use privacy with prefill_router"
             )));
         }
-        if !config.accept_external_signal
-            && config.deterministic.is_none()
-            && config.classifier.is_none()
-        {
+        if !config.accept_external_signal && config.classifier.is_none() {
             return Err(RunnerError::configuration(format!(
                 "route {route_name} privacy must configure at least one request input"
             )));
         }
-        let detectors = config
-            .deterministic
-            .as_ref()
-            .map(|config| config.build(route_name))
-            .transpose()?;
         let restricted_targets =
             self.resolve_lane_targets(route_name, route_config, Some(&config.restricted_targets))?;
         let restricted_decision_target = match (
@@ -424,13 +397,7 @@ impl DeploymentConfig {
             llm_clients,
             decision_clients,
         )?;
-        let mut policy = PrivacyPolicy::new(config.accept_external_signal, detectors, classifier)
-            .map_err(|error| {
-            RunnerError::configuration_source(
-                format!("route {route_name} privacy detectors could not be compiled"),
-                error,
-            )
-        })?;
+        let mut policy = PrivacyPolicy::new(config.accept_external_signal, classifier);
         if matches!(&config.restriction_scope, RestrictionScope::Task) {
             policy = policy.with_task_retention();
         }
@@ -1330,6 +1297,7 @@ bogus = true
 #[cfg(test)]
 mod deployment_tests {
     use super::*;
+    use crate::mark_privacy_restricted;
     use serde_json::json;
     use switchyard_protocol::{Message, Request, Role};
 
@@ -1431,24 +1399,23 @@ weak = "weak"
         )
     }
 
-    fn deterministic_privacy_config() -> String {
+    fn external_privacy_config() -> String {
         format!(
             r#"{VALID_CONFIG}
 
+[routes.passthrough.privacy]
+accept_external_signal = true
+
 [routes.passthrough.privacy.restricted_targets]
 weak = "strong"
-
-[routes.passthrough.privacy.deterministic]
-detectors = ["bearer_token"]
 "#
         )
     }
 
     fn task_retained_privacy_config() -> String {
-        deterministic_privacy_config().replace(
-            "[routes.passthrough.privacy.restricted_targets]",
-            "[routes.passthrough.privacy]\nrestriction_scope = \"task\"\n\n\
-             [routes.passthrough.privacy.restricted_targets]",
+        external_privacy_config().replace(
+            "accept_external_signal = true",
+            "accept_external_signal = true\nrestriction_scope = \"task\"",
         )
     }
 
@@ -1570,32 +1537,37 @@ clear_threshold = 0.9
     }
 
     #[tokio::test]
-    async fn deterministic_privacy_selects_the_restricted_lane() -> RunnerResult<()> {
-        let configured = deterministic_privacy_config();
+    async fn external_privacy_selects_the_restricted_lane() -> RunnerResult<()> {
+        let configured = external_privacy_config();
         let runner = Runner::from_toml(&configured)?;
         let route = runner
             .route("switchyard/passthrough")
             .expect("privacy route should exist");
 
-        assert_eq!(
-            route
-                .decide(Request::default())
-                .await?
-                .selected_model_id()?,
-            "weak/model"
-        );
         let mut request = Request::default();
         request.llm_request.messages.push(Message::text(
             Role::User,
-            "Authorization: Bearer abcdefghijklmnop",
+            "Contact user@example.test. Authorization: Bearer abcdefghijklmnop",
         ));
+        assert_eq!(
+            route.decide(request.clone()).await?.selected_model_id()?,
+            "weak/model"
+        );
+        mark_privacy_restricted(&mut request);
         assert_eq!(
             route.decide(request).await?.selected_model_id()?,
             "strong/model"
         );
 
-        let empty = configured.replace("detectors = [\"bearer_token\"]", "detectors = []");
-        assert!(error_message(&empty).contains("must configure at least one detector"));
+        let empty = configured.replace(
+            "accept_external_signal = true",
+            "accept_external_signal = false",
+        );
+        assert!(error_message(&empty).contains("must configure at least one request input"));
+        let obsolete = format!(
+            "{configured}\n[routes.passthrough.privacy.deterministic]\ndetectors = [\"email\"]\n"
+        );
+        assert!(error_message(&obsolete).contains("unknown field `deterministic`"));
         Ok(())
     }
 
@@ -1605,31 +1577,40 @@ clear_threshold = 0.9
         let route = runner
             .route("switchyard/passthrough")
             .expect("privacy route should exist");
-        let request = |task_id: Option<&str>, text: &str| {
+        let request = |task_id: Option<&str>, text: &str, restricted: bool| {
             let mut request = Request::default();
             request
                 .llm_request
                 .messages
                 .push(Message::text(Role::User, text));
             request.metadata.get_or_insert_default().task_id = task_id.map(str::to_string);
+            if restricted {
+                mark_privacy_restricted(&mut request);
+            }
             request
         };
 
-        for (task_id, text, expected) in [
-            (Some("task-a"), "ordinary turn", "weak/model"),
+        for (task_id, text, restricted, expected) in [
+            (Some("task-a"), "ordinary turn", false, "weak/model"),
             (
                 Some("task-a"),
                 "Authorization: Bearer abcdefghijklmnop",
+                true,
                 "strong/model",
             ),
-            (Some("task-a"), "later clear turn", "strong/model"),
-            (Some("task-b"), "independent clear task", "weak/model"),
-            (None, "unkeyed task", "strong/model"),
-            (Some(" "), "invalid task id", "strong/model"),
+            (Some("task-a"), "later clear turn", false, "strong/model"),
+            (
+                Some("task-b"),
+                "independent clear task",
+                false,
+                "weak/model",
+            ),
+            (None, "unkeyed task", false, "strong/model"),
+            (Some(" "), "invalid task id", false, "strong/model"),
         ] {
             assert_eq!(
                 route
-                    .decide(request(task_id, text))
+                    .decide(request(task_id, text, restricted))
                     .await?
                     .selected_model_id()?,
                 expected,

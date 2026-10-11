@@ -1007,7 +1007,7 @@ mod tests {
                     "target": "standard",
                     "privacy": {
                         "restricted_targets": {"standard": "restricted"},
-                        "deterministic": {"detectors": ["email"]},
+                        "accept_external_signal": true,
                     },
                 }
             }
@@ -1084,31 +1084,34 @@ mod tests {
             .await;
         let runtime = privacy_runtime(&format!("{}/v1", server.uri()));
 
-        for (text, expected, succeeds) in [
+        for (restricted, expected, succeeds) in [
             (
-                "hello",
+                false,
                 json!({"lane": "standard", "source": "policy", "reason_code": "all_clear"}),
                 true,
             ),
             (
-                "Contact user@example.com",
-                json!({"lane": "restricted", "source": "deterministic", "reason_code": "email"}),
+                true,
+                json!({"lane": "restricted", "source": "external_signal", "reason_code": "restricted"}),
                 false,
             ),
         ] {
-            let request = runtime
+            let mut request = runtime
                 .decode_request(
                     WireFormat::OpenAiChat,
                     RelayRequest {
                         headers: Map::new(),
                         content: json!({
                             "model": "switchyard/privacy",
-                            "messages": [{"role": "user", "content": text}],
+                            "messages": [{"role": "user", "content": "hello"}],
                         }),
                     },
                     false,
                 )
                 .expect("privacy request should decode");
+            if restricted {
+                switchyard_runner::mark_privacy_restricted(&mut request);
+            }
             let execution = runtime
                 .execute_buffered(WireFormat::OpenAiChat, request)
                 .await;
