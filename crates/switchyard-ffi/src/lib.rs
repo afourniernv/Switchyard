@@ -24,7 +24,7 @@ use tokio_util::task::TaskTracker;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 type ModelGroups = HashMap<String, Option<Vec<ModelId>>>;
 
-/// Returns the compatibility generation of the C interface and its JSON payloads.
+/// Returns the compatibility generation for C signatures and JSON payloads.
 #[unsafe(no_mangle)]
 pub extern "C" fn sy_abi_version() -> u32 {
     1
@@ -153,11 +153,11 @@ struct RunState {
     cancellation: CancellationToken,
 }
 
-/// Routing run with independent reader, reply, and cancellation access.
+/// Routing run that owns pending calls and callback cleanup.
 pub struct SyRun {
     state: Arc<RunState>,
     tasks: TaskTracker,
-    // Tasks retain state, not the runtime; free joins them before releasing this owner.
+    // Tasks retain only run state; free joins them before dropping the runtime.
     engine: Arc<Engine>,
 }
 
@@ -213,7 +213,7 @@ impl RunState {
         })
     }
 
-    // Cancellation and reply delivery share this lock, so only one can win.
+    // Serialize cancellation with reply delivery.
     fn stop(&self, status: RunStatus) {
         {
             let mut lifecycle = self.lifecycle.lock();
@@ -315,7 +315,6 @@ impl ReadGuard {
     }
 }
 
-// Release the returned error through sy_string_free.
 fn error_string(message: String) -> *mut c_char {
     match CString::new(message) {
         Ok(message) => message.into_raw(),
@@ -325,7 +324,7 @@ fn error_string(message: String) -> *mut c_char {
     }
 }
 
-// Input must be valid, NUL-terminated UTF-8; parsed values do not borrow it.
+// The input must be NUL-terminated; parsed values do not borrow it.
 unsafe fn parse<T: serde::de::DeserializeOwned>(input: *const c_char) -> Result<T> {
     if input.is_null() {
         return Err("missing JSON input".into());
@@ -492,13 +491,13 @@ pub unsafe extern "C" fn sy_run_new(
     }
 }
 
-/// Schedules one routing read. Acceptance returns NULL and delivers exactly one callback.
-/// A returned error rejects the read without invoking its callback.
-/// Callback strings are owned by the host and must be released with `sy_string_free`.
+/// Requests the next step asynchronously. Only one read may be pending per run.
+/// NULL accepts the read (one callback); an owned error rejects it (no callback).
+/// Other runs, model replies, and cancellation can proceed independently.
 /// # Safety
-/// The run must remain live during submission. The callback and its integer token must remain
-/// valid until the callback returns; callbacks may overlap and may run before submission returns.
-/// Callbacks must return promptly, must not unwind, and must not call blocking bridge functions.
+/// Keep the run live during this call and the callback state live until its callback returns.
+/// Callbacks may overlap or run before this call returns. Free their strings with `sy_string_free`.
+/// Callbacks must return promptly without unwinding, calling `sy_run_respond`, or freeing handles.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sy_run_next_async(
     run: *const SyRun,
@@ -618,7 +617,7 @@ pub unsafe extern "C" fn sy_run_respond(
     }
 }
 
-/// Signals cancellation; accepted callbacks finish before `sy_run_free` returns.
+/// Signals cancellation without waiting for callbacks.
 /// # Safety
 /// The run must remain live for the duration of this call.
 #[unsafe(no_mangle)]
@@ -632,9 +631,9 @@ pub unsafe extern "C" fn sy_run_cancel(run: *const SyRun) {
 
 /// Cancels a run, waits for accepted callbacks to return, and frees it.
 /// # Safety
-/// Pass a run returned by `sy_run_new` once, with no concurrent bridge calls, or NULL.
-/// Do not call from a completion callback or Tokio task. Callback state must remain live
-/// until its callback returns or this function finishes.
+/// Pass a handle from `sy_run_new` once, or NULL. Other calls using it must have returned.
+/// Accepted callbacks may still be active; keep their state live until they return.
+/// Do not call from a completion callback or Tokio task.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sy_run_free(run: *mut SyRun) {
     if !run.is_null() {
@@ -644,7 +643,7 @@ pub unsafe extern "C" fn sy_run_free(run: *mut SyRun) {
 
 /// Frees the router handle; existing runs retain its engine.
 /// # Safety
-/// Pass a router returned by `sy_router_new` once, with no concurrent users, or NULL.
+/// Pass a handle from `sy_router_new` once, with no concurrent calls using it, or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sy_router_free(router: *mut SyRouter) {
     if !router.is_null() {

@@ -46,7 +46,7 @@ fn received_step(receiver: &mpsc::Receiver<Completion>) -> Value {
     serde_json::from_slice(output.as_bytes()).unwrap()
 }
 
-// The ABI generation is independent of the package release.
+// ABI generations are independent of package releases.
 #[test]
 fn abi_version_identifies_v1_contract() {
     assert_eq!(sy_abi_version(), 1);
@@ -107,7 +107,6 @@ fn pending_advisor() -> (Box<SyRun>, u64) {
     (run, call["id"].as_u64().unwrap())
 }
 
-// A successful outcome remains terminal on every later read.
 #[test]
 fn completed_runs_reject_further_reads() {
     let router = router(json!({"type": "passthrough", "target": "capable"}));
@@ -129,7 +128,6 @@ fn completed_runs_reject_further_reads() {
     }
 }
 
-// Cancellation prevents a host from fulfilling work that the run no longer needs.
 #[test]
 fn cancelled_runs_reject_pending_replies() {
     let (run, id) = pending_advisor();
@@ -138,7 +136,7 @@ fn cancelled_runs_reject_pending_replies() {
     assert_eq!(error_message(error), "routing cancelled");
 }
 
-// A typed decoding failure must leave the call available for a corrected reply.
+// A malformed reply must not consume its call ID.
 #[test]
 fn invalid_model_replies_preserve_pending_calls() {
     let (run, id) = pending_advisor();
@@ -154,7 +152,7 @@ fn invalid_model_replies_preserve_pending_calls() {
     assert_eq!(next(&run)["type"], "done");
 }
 
-// Pending host work yields the only runtime worker without creating blocking threads.
+// Pending reads must yield the runtime worker, not consume blocking threads.
 #[test]
 fn async_reads_wait_without_native_threads() {
     let thread_starts = Arc::new(AtomicUsize::new(0));
@@ -213,7 +211,7 @@ unsafe extern "C" fn complete_after_release(
     let _ = state.finished.send(());
 }
 
-// Free is the userdata lifetime barrier even when another owner keeps the runtime alive.
+// Keep another runtime owner so runtime shutdown cannot mask an early free.
 #[test]
 fn free_waits_for_cancelled_callback_to_return() {
     let engine = Arc::new(Engine {
@@ -262,7 +260,7 @@ fn free_waits_for_cancelled_callback_to_return() {
     );
 }
 
-// Reply order and cancellation belong to each run, including when call IDs are equal.
+// Runs may share call IDs without sharing replies or cancellation.
 #[test]
 fn async_runs_complete_independently() {
     let router = advisor_router();
@@ -304,7 +302,7 @@ fn async_runs_complete_independently() {
     }
 }
 
-// The serving target can differ from both the first candidate and the provider's model name.
+// Host fallback attribution uses target IDs, not provider model names.
 #[test]
 fn advisor_attributes_host_fallback() {
     let router = router(json!({
@@ -335,7 +333,7 @@ fn advisor_attributes_host_fallback() {
     }
 }
 
-// Child sessions retain independent phases and release their state on the final request.
+// Child sessions keep separate phases and clear them after the final request.
 #[test]
 fn plan_execute_isolates_and_finishes_child_sessions() {
     let router = router(json!({
@@ -369,7 +367,7 @@ fn plan_execute_isolates_and_finishes_child_sessions() {
     }
 }
 
-// Child lineage alone does not send maintenance requests through the delegated-work policy.
+// Child identity alone must not activate the delegated-work policy.
 #[test]
 fn delegated_work_uses_subagent_model_groups() {
     let router = router(json!({
@@ -409,7 +407,7 @@ fn invalid_router_input_returns_owned_errors() {
     unsafe { sy_string_free(error) };
 }
 
-// An unwinding panic becomes an owned error at the exported C boundary.
+// Unwinding panics become owned errors at the C boundary.
 #[test]
 fn panics_return_owned_errors() {
     let run = SyRun::new(
