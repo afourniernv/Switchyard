@@ -11,7 +11,7 @@ use std::sync::Arc;
 use futures::{FutureExt, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use switchyard_libsy::{Algorithm, Call, LibsyError, RuntimeModels, Step, StepStream};
+use switchyard_libsy::{Algorithm, Call, LibsyError, RuntimeModels, State, Step, StepStream};
 use switchyard_protocol::{
     AggLlmResponse, Category, DecisionRequest, LlmRequest, LlmResponse, Metadata, ModelId, Request,
     Response, WireFormat,
@@ -480,7 +480,11 @@ pub unsafe extern "C" fn sy_run_new(
             ..Default::default()
         };
         let _entered = router.engine.runtime.enter();
-        let stream = Arc::clone(&router.engine.algorithm).run_stream(request, Arc::new(models));
+        let stream = Arc::clone(&router.engine.algorithm).run_stream(
+            request,
+            Arc::new(models),
+            State::default(),
+        );
         *out = Box::into_raw(Box::new(SyRun::new(stream, Arc::clone(&router.engine))));
         Ok(())
     }));
