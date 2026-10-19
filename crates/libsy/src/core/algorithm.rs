@@ -618,6 +618,13 @@ where
                         }
                         Step::CallDecision(call) => {
                             models.check_targets(std::slice::from_ref(&call.model))?;
+                            if models.has_target_restriction
+                                && call.request.model.as_ref() != Some(&call.model)
+                            {
+                                return Err(LibsyError::AlgorithmError {
+                                    message: "decision payload model does not match selected target".into(),
+                                });
+                            }
                             in_flight.push(serve(Call::Decision(call)));
                         }
                         Step::Done(outcome) => {
@@ -952,7 +959,7 @@ mod tests {
         }
     }
 
-    struct RewrittenSteps(Arc<TargetProbe>);
+    struct RewrittenSteps(Arc<TargetProbe>, fn(&mut Step));
 
     #[async_trait]
     impl Algorithm for RewrittenSteps {
@@ -969,16 +976,16 @@ mod tests {
         }
 
         fn run_stream(self: Arc<Self>, request: Request, models: Arc<RuntimeModels>) -> StepStream {
-            Box::pin(Arc::clone(&self.0).run_stream(request, models).map(|step| {
-                step.map(|mut step| {
-                    match &mut step {
-                        Step::CallModel(call) => call.models.push("outside".into()),
-                        Step::CallDecision(call) => call.model = "outside".into(),
-                        Step::Done(outcome) => outcome.selected_model_ids.push("outside".into()),
-                    }
-                    step
-                })
-            }))
+            Box::pin(
+                Arc::clone(&self.0)
+                    .run_stream(request, models)
+                    .map(move |step| {
+                        step.map(|mut step| {
+                            (self.1)(&mut step);
+                            step
+                        })
+                    }),
+            )
         }
     }
 
@@ -1015,7 +1022,11 @@ mod tests {
             TargetProbe::Completion(target_set(&["allowed"])),
         ] {
             let result = drive(
-                Arc::new(RewrittenSteps(Arc::new(probe))),
+                Arc::new(RewrittenSteps(Arc::new(probe), |step| match step {
+                    Step::CallModel(call) => call.models.push("outside".into()),
+                    Step::CallDecision(call) => call.model = "outside".into(),
+                    Step::Done(outcome) => outcome.selected_model_ids.push("outside".into()),
+                })),
                 request(),
                 Arc::new(restricted_models()),
                 |_| async { panic!("undeclared work must not reach the host") },
@@ -1025,6 +1036,25 @@ mod tests {
                 matches!(result, Err(LibsyError::TargetNotFound { target }) if target == "outside")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn target_restriction_binds_decision_payload_to_client() {
+        let result = drive(
+            Arc::new(RewrittenSteps(
+                Arc::new(TargetProbe::Decision("judge".into())),
+                |step| {
+                    if let Step::CallDecision(call) = step {
+                        call.request.model = Some("allowed".into());
+                    }
+                },
+            )),
+            request(),
+            Arc::new(restricted_models()),
+            |_| async { panic!("mismatched decision payload must not reach the host") },
+        )
+        .await;
+        assert!(matches!(result, Err(LibsyError::AlgorithmError { .. })));
     }
 
     // Judges, fallbacks, delegated targets and local answers remain valid.

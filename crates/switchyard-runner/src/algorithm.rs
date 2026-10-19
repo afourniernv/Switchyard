@@ -657,7 +657,7 @@ impl AlgorithmSpec {
                 if let Some(weights) = weights {
                     if weights.len() != targets.len() {
                         return Err(AlgorithmConfigError::new(format!(
-                            "random privacy expected {} weights, got {}",
+                            "random expected {} weights, got {}",
                             targets.len(),
                             weights.len()
                         )));
@@ -673,7 +673,7 @@ impl AlgorithmSpec {
                 targets.retain(|target| allowed.contains(target.as_str()));
                 if targets.is_empty() {
                     return Err(AlgorithmConfigError::new(
-                        "privacy leaves random without a private target".to_string(),
+                        "target requirements leave random without an eligible target".to_string(),
                     ));
                 }
             }
@@ -691,7 +691,7 @@ impl AlgorithmSpec {
                 .find(|target| !allowed.contains(target.as_str()))
         {
             return Err(AlgorithmConfigError::new(format!(
-                "privacy decision candidate {target} must be private"
+                "decision candidate {target} does not satisfy target requirements"
             )));
         }
         let subagents = match &mut restricted {
@@ -711,14 +711,14 @@ impl AlgorithmSpec {
             .find(|target| !allowed.contains(target))
         {
             return Err(AlgorithmConfigError::new(format!(
-                "privacy requires target {target} to be private"
+                "required target {target} does not satisfy target requirements"
             )));
         }
         Ok(restricted)
     }
 
     /// Whether the algorithm supports a restricted set of configured targets.
-    pub(crate) const fn supports_privacy_lanes(&self) -> bool {
+    pub(crate) const fn supports_target_restrictions(&self) -> bool {
         !matches!(self, Self::PrefillRouter { .. })
     }
 
@@ -1909,7 +1909,7 @@ mod tests {
                 );
             assert_eq!(
                 error.to_string(),
-                "privacy decision candidate public must be private"
+                "decision candidate public does not satisfy target requirements"
             );
         }
     }

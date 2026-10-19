@@ -3,6 +3,7 @@
 
 //! Configured route execution and the clients that serve its targets.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -13,10 +14,8 @@ use switchyard_protocol::{LlmClientError, ModelId, Request, Response, WireFormat
 use thiserror::Error;
 
 use crate::DecisionTarget;
-use crate::privacy::{
-    PrivacyDecision, PrivacyLane, PrivacyPolicy, external_signal_not_accepted,
-    has_external_restriction, record_selected_lane, selected_lane, validate_mixed_request,
-};
+use crate::eligibility::{EligibilityPolicy, Requirements, has_external_requirements};
+use crate::privacy::{PrivacyDecision, PrivacyLane, PrivacyPolicy, has_external_restriction};
 
 /// Capabilities declared for one route.
 ///
@@ -118,7 +117,6 @@ pub(crate) struct ExecutionLane {
     clients: ClientRouter,
     anthropic_auxiliary_target: Option<AuxiliaryTarget>,
     responses_auxiliary_target: Option<AuxiliaryTarget>,
-    decision_targets: Vec<DecisionTarget>,
     models: Arc<RuntimeModels>,
 }
 
@@ -128,7 +126,6 @@ impl ExecutionLane {
         clients: ClientRouter,
         anthropic_auxiliary_target: Option<AuxiliaryTarget>,
         responses_auxiliary_target: Option<AuxiliaryTarget>,
-        decision_targets: Vec<DecisionTarget>,
         models: RuntimeModels,
     ) -> Self {
         Self {
@@ -136,21 +133,27 @@ impl ExecutionLane {
             clients,
             anthropic_auxiliary_target,
             responses_auxiliary_target,
-            decision_targets,
             models: Arc::new(models),
         }
     }
 }
 
-struct PrivacyExecution {
-    policy: PrivacyPolicy,
-    restricted: ExecutionLane,
+struct EligibilityExecution {
+    policy: EligibilityPolicy,
+    groups: BTreeMap<Requirements, ExecutionLane>,
+}
+
+struct LaneSelection<'a> {
+    lane: &'a ExecutionLane,
+    privacy: Option<PrivacyDecision>,
 }
 
 /// One or more execution lanes behind a configured route.
 pub struct Route {
     standard: ExecutionLane,
-    privacy: Option<PrivacyExecution>,
+    privacy: Option<PrivacyPolicy>,
+    eligibility: Option<EligibilityExecution>,
+    decision_targets: Vec<DecisionTarget>,
     caller_auth: Option<CallerAuthKind>,
     capabilities: ModelCapabilities,
 }
@@ -180,11 +183,11 @@ impl Route {
                 clients,
                 anthropic_auxiliary_target,
                 responses_auxiliary_target,
-                decision_targets,
                 models,
             ),
             caller_auth,
             capabilities,
+            decision_targets,
         )
     }
 
@@ -192,49 +195,96 @@ impl Route {
         lane: ExecutionLane,
         caller_auth: Option<CallerAuthKind>,
         capabilities: ModelCapabilities,
+        decision_targets: Vec<DecisionTarget>,
     ) -> Self {
         Self {
             standard: lane,
             privacy: None,
+            eligibility: None,
+            decision_targets,
             caller_auth,
             capabilities,
         }
     }
 
-    pub(crate) fn with_privacy(mut self, policy: PrivacyPolicy, restricted: ExecutionLane) -> Self {
-        self.privacy = Some(PrivacyExecution { policy, restricted });
+    pub(crate) fn with_privacy_policy(mut self, policy: PrivacyPolicy) -> Self {
+        self.privacy = Some(policy);
         self
     }
 
-    async fn select_lane(
-        &self,
-        request: &Request,
-    ) -> Result<(&ExecutionLane, Option<PrivacyDecision>), RunnerError> {
-        let Some(privacy) = &self.privacy else {
-            if has_external_restriction(request) {
-                return Err(external_signal_not_accepted().into());
+    pub(crate) fn with_eligibility(
+        mut self,
+        policy: EligibilityPolicy,
+        groups: BTreeMap<Requirements, ExecutionLane>,
+    ) -> Self {
+        self.eligibility = Some(EligibilityExecution { policy, groups });
+        self
+    }
+
+    async fn select_lane(&self, request: &Request) -> Result<LaneSelection<'_>, RunnerError> {
+        if let Some(eligibility) = &self.eligibility {
+            let mut requirements = eligibility.policy.admit(request)?;
+            let mut privacy = match &self.privacy {
+                Some(policy) => Some(
+                    policy
+                        .assess(
+                            request,
+                            &requirements,
+                            request.llm_request.model.as_deref().unwrap_or_default(),
+                            self.algorithm_name(),
+                        )
+                        .await?,
+                ),
+                None => None,
+            };
+            let retain = privacy
+                .as_ref()
+                .is_some_and(PrivacyDecision::retain_for_task);
+            if privacy
+                .as_ref()
+                .is_some_and(|decision| matches!(decision.selected_lane(), PrivacyLane::Restricted))
+            {
+                requirements.insert("private".into());
             }
-            return Ok((&self.standard, None));
-        };
-        validate_mixed_request(request)?;
-        let route = request.llm_request.model.as_deref().unwrap_or_default();
-        let algorithm = self.algorithm_name();
-        let decision = privacy.policy.decide(request, route, algorithm).await?;
-        tracing::debug!(
-            switchyard.route = route,
-            switchyard.algorithm = algorithm,
-            privacy.lane = decision.lane(),
-            privacy.source = decision.source(),
-            privacy.reason_code = decision.reason_code(),
-            privacy.clear_score = decision.clear_score(),
-            privacy.clear_threshold = decision.clear_threshold(),
-            "privacy lane selected"
-        );
-        let lane = match decision.selected_lane() {
-            PrivacyLane::Standard => &self.standard,
-            PrivacyLane::Restricted => &privacy.restricted,
-        };
-        Ok((lane, Some(decision)))
+            if privacy.is_some() {
+                requirements = eligibility.policy.finish(request, requirements, retain)?;
+            }
+            if let Some(decision) = &mut privacy
+                && requirements.contains("private")
+                && matches!(decision.selected_lane(), PrivacyLane::Standard)
+            {
+                *decision = PrivacyDecision::task_restriction("retained_restriction");
+            }
+            let lane = if requirements.is_empty() {
+                &self.standard
+            } else {
+                eligibility.groups.get(&requirements).ok_or_else(|| {
+                    RunnerError::configuration("eligible execution group was not constructed")
+                })?
+            };
+            tracing::debug!(
+                switchyard.route = request.llm_request.model.as_deref().unwrap_or_default(),
+                switchyard.algorithm = self.algorithm_name(),
+                eligibility.required_labels = ?requirements,
+                privacy.lane = privacy.as_ref().map(PrivacyDecision::lane),
+                privacy.source = privacy.as_ref().map(PrivacyDecision::source),
+                privacy.reason_code = privacy.as_ref().map(PrivacyDecision::reason_code),
+                privacy.clear_score = privacy.as_ref().and_then(PrivacyDecision::clear_score),
+                privacy.clear_threshold = privacy.as_ref().and_then(PrivacyDecision::clear_threshold),
+                "eligible targets selected"
+            );
+            return Ok(LaneSelection { lane, privacy });
+        }
+        if has_external_requirements(request) || has_external_restriction(request) {
+            return Err(LlmClientError::InvalidRequest {
+                message: "route does not accept target requirements".to_string(),
+            }
+            .into());
+        }
+        Ok(LaneSelection {
+            lane: &self.standard,
+            privacy: None,
+        })
     }
 
     /// Returns the configured libsy algorithm name.
@@ -253,17 +303,8 @@ impl Route {
     }
 
     /// Resolves a selected model to this route's non-secret target metadata.
-    pub(crate) fn decision_target(
-        &self,
-        model: &ModelId,
-        request: &Request,
-    ) -> Option<DecisionTarget> {
-        let targets = match (&self.privacy, selected_lane(request)) {
-            (None, _) | (Some(_), Some(PrivacyLane::Standard)) => &self.standard.decision_targets,
-            (Some(privacy), Some(PrivacyLane::Restricted)) => &privacy.restricted.decision_targets,
-            (Some(_), None) => return None,
-        };
-        targets
+    pub(crate) fn decision_target(&self, model: &ModelId) -> Option<DecisionTarget> {
+        self.decision_targets
             .iter()
             .find(|target| target.model == *model)
             .cloned()
@@ -301,10 +342,11 @@ impl Route {
         observer: Option<RunObserver>,
         on_privacy_decision: impl FnOnce(&PrivacyDecision) + Send,
     ) -> Result<RunOutput, RunnerError> {
-        let (lane, privacy_decision) = self.select_lane(&request).await?;
-        if let Some(decision) = &privacy_decision {
+        let selection = self.select_lane(&request).await?;
+        if let Some(decision) = &selection.privacy {
             on_privacy_decision(decision);
         }
+        let lane = selection.lane;
         let (selected_model, response) = switchyard_llm_client::run(
             Arc::clone(&lane.algorithm),
             lane.clients.clone(),
@@ -321,19 +363,16 @@ impl Route {
 
     /// Completes routing-time calls without serving a post-routing completion.
     pub async fn decide(&self, request: Request) -> Result<RoutingOutcome, RunnerError> {
-        let (lane, privacy_decision) = self.select_lane(&request).await?;
-        let mut outcome = switchyard_llm_client::decide(
+        let selection = self.select_lane(&request).await?;
+        let lane = selection.lane;
+        switchyard_llm_client::decide(
             Arc::clone(&lane.algorithm),
             lane.clients.clone(),
             request,
             Arc::clone(&lane.models),
         )
         .await
-        .map_err(RunnerError::from)?;
-        if let Some(decision) = privacy_decision {
-            record_selected_lane(&mut outcome.request, decision.selected_lane());
-        }
-        Ok(outcome)
+        .map_err(RunnerError::from)
     }
 
     /// Executes a model-bearing provider operation through a compatible target.
@@ -342,7 +381,8 @@ impl Route {
         request: Request,
         operation: AuxiliaryOperation,
     ) -> Result<Value, RunnerError> {
-        let (lane, _) = self.select_lane(&request).await?;
+        let selection = self.select_lane(&request).await?;
+        let lane = selection.lane;
         let target = match operation {
             AuxiliaryOperation::AnthropicCountTokens => &lane.anthropic_auxiliary_target,
             AuxiliaryOperation::ResponsesInputTokens | AuxiliaryOperation::ResponsesCompact => {
@@ -375,6 +415,18 @@ mod tests {
 
     use super::*;
     use crate::privacy::{SemanticPrivacyClassifier, mark_privacy_restricted};
+
+    impl Route {
+        fn with_privacy(self, policy: PrivacyPolicy, restricted: ExecutionLane) -> Self {
+            let requirements = Requirements::from(["private".into()]);
+            self.with_eligibility(
+                EligibilityPolicy::new(true, vec![vec!["private".into()]], false)
+                    .expect("privacy requirement set"),
+                BTreeMap::from([(requirements, restricted)]),
+            )
+            .with_privacy_policy(policy)
+        }
+    }
 
     enum RoutingCall {
         Llm,
@@ -435,6 +487,7 @@ mod tests {
 
     struct VerdictClient {
         calls: Arc<AtomicUsize>,
+        gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     #[async_trait::async_trait]
@@ -466,7 +519,12 @@ mod tests {
             &self,
             _request: DecisionRequest,
         ) -> Result<DecisionResponse, LlmClientError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0
+                && let Some((started, release)) = &self.gate
+            {
+                started.notify_one();
+                release.notified().await;
+            }
             let mut probabilities = [
                 "no_sensitive_content",
                 "personal_data",
@@ -521,7 +579,6 @@ mod tests {
                 client: auxiliary_client,
             }),
             None,
-            Vec::new(),
             models,
         )
     }
@@ -542,87 +599,163 @@ mod tests {
         }
     }
 
+    // Rejected content must not erase authoritative requirements supplied with that turn.
     #[tokio::test]
-    async fn privacy_restricted_lane_covers_judge_fallbacks_and_auxiliary_calls() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
+    async fn rejected_turn_retains_requirements() {
         let client: Arc<dyn RoutedLlmClient> = Arc::new(RecordingClient {
-            calls: Arc::clone(&calls),
+            calls: Arc::new(Mutex::new(Vec::new())),
         });
-        let standard = lane(
-            Arc::new(Passthrough),
-            Arc::clone(&client),
-            RuntimeModels::new(HashMap::from([(
-                Category::Any,
-                vec!["standard-primary".into()],
-            )])),
-            "standard-auxiliary",
-        );
-        let restricted = lane(
-            Arc::new(CallThenRoute(RoutingCall::Llm)),
-            client,
-            RuntimeModels::new(HashMap::from([
-                (Category::Judge, vec!["restricted-judge".into()]),
-                (
-                    Category::Any,
-                    vec!["restricted-primary".into(), "restricted-fallback".into()],
-                ),
-            ])),
-            "restricted-auxiliary",
-        );
-        let route = Route::from_lane(standard, None, ModelCapabilities::default())
-            .with_privacy(PrivacyPolicy::new(true, None), restricted);
-
-        let mut observed = None;
-        let output = route
-            .execute_with_privacy_observer(restricted_request(), None, |decision| {
-                observed = Some((decision.lane(), decision.source(), decision.reason_code()));
-            })
-            .await
-            .expect("restricted fallback should answer");
-        assert_eq!(
-            observed,
-            Some(("restricted", "external_signal", "restricted"))
-        );
-        assert_eq!(output.selected_model, "restricted-primary");
-        assert_eq!(
-            output.response.served_model().map(ModelId::as_str),
-            Some("restricted-fallback")
-        );
-        assert_eq!(
-            *calls.lock().expect("calls lock"),
-            [
-                ModelId::from("restricted-judge"),
-                ModelId::from("restricted-primary"),
-                ModelId::from("restricted-fallback"),
-            ]
-        );
-
-        let error = route
-            .call_auxiliary(
-                restricted_request(),
-                AuxiliaryOperation::AnthropicCountTokens,
+        let build_lane = |name: &str| {
+            lane(
+                Arc::new(Passthrough),
+                Arc::clone(&client),
+                RuntimeModels::new(HashMap::from([(Category::Any, vec![name.into()])])),
+                name,
             )
-            .await
-            .expect_err("empty auxiliary client should reject the model");
-        assert!(
-            error.to_string().contains("restricted-auxiliary"),
-            "{error}"
+        };
+        let groups = BTreeMap::from([
+            (Requirements::from(["eu".into()]), build_lane("eu")),
+            (
+                Requirements::from(["eu".into(), "private".into()]),
+                build_lane("private-eu"),
+            ),
+        ]);
+        let policy = EligibilityPolicy::new(
+            true,
+            vec![vec!["eu".into()], vec!["eu".into(), "private".into()]],
+            true,
+        )
+        .expect("configured requirement sets");
+        let route = Route::from_lane(
+            build_lane("standard"),
+            None,
+            ModelCapabilities::default(),
+            Vec::new(),
+        )
+        .with_eligibility(policy, groups);
+        let mut request = Request::default();
+        request.metadata.get_or_insert_default().task_id = Some("task".into());
+        crate::require_target_labels(&mut request, ["eu"]).expect("trusted labels");
+        let outcome = route.decide(request.clone()).await.expect("EU decision");
+        assert_eq!(outcome.selected_model_id().expect("model"), "eu");
+
+        crate::require_target_labels(&mut request, ["private"]).expect("trusted labels");
+        request.llm_request.extensions.fields.insert(
+            "previous_response_id".into(),
+            Value::String("hidden".into()),
         );
+        assert!(route.decide(request).await.is_err());
+        let mut next = Request::default();
+        next.metadata.get_or_insert_default().task_id = Some("task".into());
+        let outcome = route.decide(next).await.expect("retained decision");
+        assert_eq!(outcome.selected_model_id().expect("model"), "private-eu");
     }
 
     #[tokio::test]
-    async fn restricted_typed_decision_resolves_restricted_target_metadata() {
-        let answer: ModelId = "shared-model".into();
+    async fn requirements_cover_judges_fallbacks_and_auxiliary_calls() {
+        for generic in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let client: Arc<dyn RoutedLlmClient> = Arc::new(RecordingClient {
+                calls: Arc::clone(&calls),
+            });
+            let standard = lane(
+                Arc::new(Passthrough),
+                Arc::clone(&client),
+                RuntimeModels::new(HashMap::from([(
+                    Category::Any,
+                    vec!["standard-primary".into()],
+                )])),
+                "standard-auxiliary",
+            );
+            let restricted = lane(
+                Arc::new(CallThenRoute(RoutingCall::Llm)),
+                client,
+                RuntimeModels::new(HashMap::from([
+                    (Category::Judge, vec!["restricted-judge".into()]),
+                    (
+                        Category::Any,
+                        vec!["restricted-primary".into(), "restricted-fallback".into()],
+                    ),
+                ])),
+                "restricted-auxiliary",
+            );
+            let route = Route::from_lane(standard, None, ModelCapabilities::default(), Vec::new());
+            let route = if generic {
+                let requirements = Requirements::from(["eu".into(), "private".into()]);
+                route.with_eligibility(
+                    EligibilityPolicy::new(
+                        true,
+                        vec![requirements.iter().cloned().collect()],
+                        false,
+                    )
+                    .expect("configured labels"),
+                    BTreeMap::from([(requirements, restricted)]),
+                )
+            } else {
+                route.with_privacy(PrivacyPolicy::new(None, Requirements::new()), restricted)
+            };
+            let request = || {
+                if generic {
+                    let mut request = Request::default();
+                    crate::require_target_labels(&mut request, ["private", "eu"])
+                        .expect("trusted labels");
+                    request
+                } else {
+                    restricted_request()
+                }
+            };
+
+            let mut observed = None;
+            let output = route
+                .execute_with_privacy_observer(request(), None, |decision| {
+                    observed = Some((decision.lane(), decision.source(), decision.reason_code()));
+                })
+                .await
+                .expect("restricted fallback should answer");
+            assert_eq!(
+                observed,
+                (!generic).then_some(("restricted", "external_signal", "restricted"))
+            );
+            assert_eq!(output.selected_model, "restricted-primary");
+            assert_eq!(
+                output.response.served_model().map(ModelId::as_str),
+                Some("restricted-fallback")
+            );
+            assert_eq!(
+                *calls.lock().expect("calls lock"),
+                [
+                    ModelId::from("restricted-judge"),
+                    ModelId::from("restricted-primary"),
+                    ModelId::from("restricted-fallback"),
+                ]
+            );
+
+            let error = route
+                .call_auxiliary(request(), AuxiliaryOperation::AnthropicCountTokens)
+                .await
+                .expect_err("empty auxiliary client should reject the model");
+            assert!(
+                error.to_string().contains("restricted-auxiliary"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restricted_typed_decision_resolves_configured_target_metadata() {
+        let answer: ModelId = "restricted-answer".into();
         let llm: Arc<dyn RoutedLlmClient> = Arc::new(RecordingClient {
             calls: Arc::new(Mutex::new(Vec::new())),
         });
-        let mut standard = lane(
+        let standard = lane(
             Arc::new(Passthrough),
             Arc::clone(&llm),
-            RuntimeModels::new(HashMap::from([(Category::Any, vec![answer.clone()])])),
+            RuntimeModels::new(HashMap::from([(
+                Category::Any,
+                vec!["standard-answer".into(), answer.clone()],
+            )])),
             "standard-auxiliary",
         );
-        standard.decision_targets = vec![decision_target("standard", &answer)];
 
         let judge: ModelId = "restricted-decision".into();
         let decision_calls = Arc::new(AtomicUsize::new(0));
@@ -634,19 +767,27 @@ mod tests {
                     judge.clone(),
                     Arc::new(VerdictClient {
                         calls: Arc::clone(&decision_calls),
+                        gate: None,
                     }) as Arc<dyn RoutedDecisionClient>,
                 )]),
             ),
             None,
             None,
-            vec![decision_target("restricted", &answer)],
             RuntimeModels::new(HashMap::from([
                 (Category::Judge, vec![judge]),
                 (Category::Any, vec![answer]),
             ])),
         );
-        let route = Route::from_lane(standard, None, ModelCapabilities::default())
-            .with_privacy(PrivacyPolicy::new(true, None), restricted);
+        let route = Route::from_lane(
+            standard,
+            None,
+            ModelCapabilities::default(),
+            vec![
+                decision_target("standard", &ModelId::from("standard-answer")),
+                decision_target("restricted", &ModelId::from("restricted-answer")),
+            ],
+        )
+        .with_privacy(PrivacyPolicy::new(None, Requirements::new()), restricted);
         let route_id: ModelId = "switchyard/private".into();
         let runner = crate::Runner::new(vec![(route_id.clone(), route)]);
 
@@ -696,12 +837,16 @@ mod tests {
             "privacy-judge".into(),
             Arc::new(VerdictClient {
                 calls: Arc::clone(&classifier_calls),
+                gate: None,
             }),
             None,
             0.9,
         );
-        let route = Route::from_lane(standard, None, ModelCapabilities::default())
-            .with_privacy(PrivacyPolicy::new(true, Some(classifier)), restricted);
+        let route = Route::from_lane(standard, None, ModelCapabilities::default(), Vec::new())
+            .with_privacy(
+                PrivacyPolicy::new(Some(classifier), Requirements::from(["private".into()])),
+                restricted,
+            );
 
         assert_eq!(
             route
@@ -740,5 +885,87 @@ mod tests {
             "restricted-primary"
         );
         assert_eq!(classifier_calls.load(Ordering::Relaxed), 1);
+    }
+
+    // An assessment cannot erase a concurrent restriction or inspect an ineligible request.
+    #[tokio::test]
+    async fn classification_rechecks_task_requirements_and_its_own_eligibility() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let classifier = SemanticPrivacyClassifier::decision(
+            "private-eu-judge".into(),
+            Arc::new(VerdictClient {
+                calls: Arc::clone(&calls),
+                gate: Some((Arc::clone(&started), Arc::clone(&release))),
+            }),
+            None,
+            0.9,
+        );
+        let client: Arc<dyn RoutedLlmClient> = Arc::new(RecordingClient {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let build_lane = |name: &str| {
+            lane(
+                Arc::new(Passthrough),
+                Arc::clone(&client),
+                RuntimeModels::new(HashMap::from([(Category::Any, vec![name.into()])])),
+                name,
+            )
+        };
+        let requirement_sets = [
+            vec!["eu"],
+            vec!["us"],
+            vec!["private"],
+            vec!["eu", "private"],
+        ]
+        .map(|labels| labels.into_iter().map(str::to_string).collect::<Vec<_>>());
+        let groups = requirement_sets
+            .iter()
+            .map(|labels| {
+                (
+                    labels.iter().cloned().collect(),
+                    build_lane(&labels.join("-")),
+                )
+            })
+            .collect();
+        let route = Route::from_lane(
+            build_lane("standard"),
+            None,
+            ModelCapabilities::default(),
+            Vec::new(),
+        )
+        .with_eligibility(
+            EligibilityPolicy::new(true, requirement_sets.into(), true).expect("requirement sets"),
+            groups,
+        )
+        .with_privacy_policy(PrivacyPolicy::new(
+            Some(classifier),
+            Requirements::from(["private".into(), "eu".into()]),
+        ));
+        let request = |task: &str, labels: &[&str]| {
+            let mut request = Request::default();
+            request.metadata.get_or_insert_default().task_id = Some(task.into());
+            crate::require_target_labels(&mut request, labels).expect("trusted labels");
+            request
+        };
+        let slow = route.decide(request("shared", &[]));
+        let tighten = async {
+            started.notified().await;
+            let outcome = route.decide(request("shared", &["eu"])).await;
+            release.notify_one();
+            outcome
+        };
+        let outcomes = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(slow, tighten)
+        })
+        .await
+        .expect("no lock may be held across classification");
+        for outcome in [outcomes.0, outcomes.1] {
+            let outcome = outcome.expect("EU decision");
+            assert_eq!(outcome.selected_model_id().expect("model"), "eu");
+        }
+        assert!(route.decide(request("other", &["us"])).await.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 }

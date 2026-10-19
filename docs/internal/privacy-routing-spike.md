@@ -1,199 +1,293 @@
-# Privacy routing spike
+# Target eligibility and privacy routing spike
 
-This spike lets an application restrict which configured targets Switchyard may call. It does
-not add a routing algorithm. The target flag and configuration below are proposed, not released.
+This is the agreed prototype contract, not a released feature. Eligibility limits which
+configured targets a router may call; it does not replace the routing algorithm or classify
+request content. Labels such as `private` and `eu` are deployment-owned approvals, not proof
+of endpoint location, security or provider retention policy.
 
-`private = true` means the deployment owner approves that target for restricted requests.
-It does not detect sensitive content, verify the endpoint, or prevent a provider from retaining
-data. Targets default to `private = false`.
+This note describes the current uncommitted changes in the canonical local worktree, not a
+published release or restacked branch state. Classification and trusted requirements now use
+one eligibility engine. Composition is implemented and validated locally; individual branches
+have not been restacked.
 
-## Target approval and an external signal
+## Labels and trusted requirements
 
-Declare the targets normally and flag the approved ones. The route lists its usual candidates;
-there is no replacement-target map. Client definitions are omitted here.
+Targets declare flat string labels. The route names the finite requirement sets
+it supports; the empty set is implicit. Client definitions are omitted here.
 
 ```toml
 [targets.fast]
 id = "public-model"
 llm_client = "public_endpoint"
+labels = ["us"]
 
-[targets.internal]
-id = "internal-model"
-llm_client = "internal_endpoint"
-private = true
+[targets.private_us]
+id = "internal-us-model"
+llm_client = "us_endpoint"
+labels = ["private", "us"]
+
+[targets.private_eu]
+id = "internal-eu-model"
+llm_client = "eu_endpoint"
+labels = ["private", "eu"]
 
 [routes.coding]
 id = "switchyard/coding"
 type = "random"
-targets = ["fast", "internal"]
-weights = [3, 1]
+targets = ["fast", "private_us", "private_eu"]
+weights = [3, 1, 1]
 
-[routes.coding.privacy]
+[routes.coding.eligibility]
 accept_external_signal = true
+restriction_scope = "request"
+
+[routes.coding.eligibility.requirement_sets]
+private = ["private"]
+eu = ["eu"]
+private_eu = ["private", "eu"]
 ```
 
-The embedded application decides whether this request needs private targets:
+The embedded application supplies requirements through the additive Rust helper:
 
 ```rust
-use switchyard_runner::mark_privacy_restricted;
+use switchyard_runner::require_target_labels;
 
-if requires_restricted_targets {
-    mark_privacy_restricted(&mut request);
-}
+require_target_labels(&mut request, ["private", "eu"])?;
 let output = route.execute(request, None).await?;
 ```
 
-Unmarked requests use both configured candidates. Marked requests can use only `internal`,
-including after a failed attempt. Random keeps the weights paired with their targets when
-filtering. No detector or classifier runs in this example.
+`require_target_labels(&mut Request, impl IntoIterator<Item = impl AsRef<str>>)` returns
+`Result<(), LlmClientError>` and merges requirements into trusted internal metadata. It adds
+no HTTP header, request-body field or Python binding. Routes must opt into external signals.
 
-The signal is trusted, in-process Rust state, not an HTTP header or a Python binding. A marked
-request fails if the route has not enabled external signals. An unmarked request can still be
-restricted by an optional semantic check.
-
-```mermaid
-flowchart TD
-    R[Request] --> T{Task already restricted?}
-    T -->|Yes| P[Configured targets flagged private]
-    T -->|No| C[External signal and optional semantic assessment]
-    C -->|Clear| S[All configured targets]
-    C -->|Sensitive or indeterminate| P
-    S --> A[Configured routing algorithm]
-    P --> B[Separate instance of the same algorithm]
-    A --> SM[Standard judges, answers, fallbacks and auxiliaries]
-    B --> PM[Private judges, answers, fallbacks and auxiliaries]
-```
-
-Filtering never imports another deployment's targets or silently changes a target's role.
-Configurations fail to load if the remaining targets cannot support the chosen router.
-
-Stage, Escalation and other fixed-role routers still need their required efficient, capable
-and judge targets. A Stage route with a public efficient target and a private capable target
-therefore cannot enable this policy: filtering would remove a required role. This spike does
-not silently turn Stage into passthrough. Custom classifier pools can contain public and private
-targets; their required groups must remain usable after filtering.
-
-## Always-private workload
-
-Use an ordinary route containing only approved targets. It does not need classification or a
-second lane. Flag both targets `private = true`; Stage still makes its normal tier choice.
+For routes that require a signal on every request, use:
 
 ```toml
-[targets.internal_fast]
-id = "internal-small-model"
-llm_client = "internal_endpoint"
-private = true
-
-[targets.internal_capable]
-id = "internal-large-model"
-llm_client = "internal_endpoint"
-private = true
-
-[routes.private_coding]
-id = "switchyard/private-coding"
-type = "stage_router"
-efficient_target = "internal_fast"
-capable_target = "internal_capable"
-picker = "efficient_first"
-confidence_threshold = 0.60
+[routes.coding.eligibility]
+require_external_signal = true
 ```
 
-## Optional semantic assessment
+Requiring a signal also enables accepting it; `accept_external_signal` can be omitted.
+A missing signal is rejected before classification or other model calls, even when the task
+already has retained requirements. Legacy `mark_privacy_restricted()` signals also qualify.
 
-Add one classifier to the mixed route. Generic LLM and typed decision models are alternatives,
-not consecutive judges. Both require a target flagged `private = true`: the classifier receives
-the content before deciding which targets may answer.
+The application can explicitly supply no additional requirements:
+
+```rust
+require_target_labels(&mut request, std::iter::empty::<&str>())?;
+```
+
+An empty signal does not clear retained task requirements. Presence does not prove the
+application performed an assessment, and this option does not synchronize task state across
+replicas. The default remains optional; existing routes need no changes.
+
+Every required label must exactly match a target label; a target may have extra labels.
+Each `requirement_sets` entry names a supported label set. The names also identify optional
+target overrides; applications still supply labels, not those names. Order and duplicate labels
+do not change a set.
+In the example, `["private"]` admits both internal targets, while `["private", "eu"]` admits only
+`private_eu`. No requirements admits all configured candidates. Only declared requirement sets
+are supported; Runner does not generate other combinations.
+
+Unknown or malformed labels fail closed. A valid but unsupported requirement set also returns an
+error; Switchyard never drops a requirement or chooses a nearby requirement set to keep serving.
+Completion and decision-target aliases sharing a client and model must declare the same labels.
+Labels are limited to 128 bytes each, with at most 32 distinct labels per route and per target.
+Routes support at most 64 canonical requirement sets, including the implicit empty set.
+
+## Prebuilt execution groups
+
+Runner builds a separate execution lane for each declared requirement set, using only targets
+that satisfy it. The existing router still chooses among that pool, including its judges,
+answer candidates, fallbacks and auxiliaries. Random keeps weights paired with their targets.
+Failures never restore an ineligible target or import one from another deployment.
+
+Fixed-role routers keep their efficient, capable and judge roles. A requirement set can bind
+those existing names to approved replacements without changing the router settings. For example,
+assuming the normal targets and their EU-approved replacements are defined:
+
+```toml
+[routes.coding_stage]
+id = "switchyard/coding-stage"
+type = "stage_router"
+efficient_target = "fast"
+capable_target = "capable"
+picker = "efficient_first"
+confidence_threshold = 0.5
+classifier = { target = "judge", base_threshold = 0.5 }
+
+[routes.coding_stage.eligibility]
+require_external_signal = true
+
+[routes.coding_stage.eligibility.requirement_sets]
+private_eu = ["private", "eu"]
+
+[routes.coding_stage.eligibility.target_overrides.private_eu]
+fast = "private_fast_eu"
+capable = "private_capable_eu"
+judge = "private_judge_eu"
+```
+
+An explicit empty signal uses the original targets. The `private` plus `eu` requirements use
+the replacements, each of which must declare both labels. This binding is built once at startup;
+model calls, prompts, fallbacks, subagent policies and auxiliary operations use that lane's
+resolved targets. Decision metadata reports the replacement targets.
+
+Mappings apply once: `fast = "private_fast_eu"` does not follow another mapping for
+`private_fast_eu`. Unmapped roles must already meet the requirements. Missing replacements,
+unused names, changed LLM/decision target kinds and conflicting mappings for equivalent label
+sets are configuration errors. Empty-set overrides are rejected so unrestricted routing stays
+unchanged. Random overrides cannot collapse distinct models onto one weighted entry.
+
+The same binding supports Auto, PlanExecute, Advisor, passthrough, Composite and classifier
+routes, including typed judges and subagent targets. Judge prompts and decision evidence are
+unchanged; deployments must ensure they remain appropriate for replacement models. Completion
+model IDs must identify one client across the route's groups so decision metadata is unambiguous.
+
+Without overrides, a declared group missing a required role remains a configuration error.
+Workloads whose configured targets already meet every fixed requirement can use an ordinary
+route without classification or extra execution groups.
+
+Legacy privacy-only configuration also uses this engine. Targets declare privacy approval through
+`labels = ["private"]`, and `mark_privacy_restricted()` contributes the `private` requirement.
+A legacy route can use the existing privacy table instead of an eligibility table:
+
+```toml
+[routes.legacy]
+id = "switchyard/legacy"
+type = "passthrough"
+target = "private_eu"
+
+[routes.legacy.privacy]
+accept_external_signal = true
+restriction_scope = "request"
+```
+
+## Task retention
+
+Set `restriction_scope = "task"` in the eligibility table and supply
+`request.metadata.task_id`. Each request adds valid requirements to the task's retained union;
+an already-constrained task must still process new requirements. A later empty or clear request
+cannot remove earlier host requirements.
+
+Declare the unions a task may accumulate. The example includes `["private", "eu"]` so a task
+can acquire `private` on one turn and `eu` on a later turn.
+
+If the union is not a configured requirement set, the request fails and the valid union remains
+retained. Unknown or malformed requirements are not retained. Missing or invalid task IDs and
+exhausted retention capacity now return errors; the older draft's private-lane fallback is not
+used. Retention is per route and process, limited to 4,096 nonempty task entries under IDs of at most
+512 bytes, with no expiry, reset API or replica coordination.
+
+State is merged under short locks, never across an await. Selection uses an admission snapshot:
+requests that already selected a group are not recalled when another request tightens the task.
+After an awaited assessment, selection must incorporate requirements retained by concurrent turns.
+
+## Optional privacy classification
+
+The privacy classifier keeps its existing six verdicts: `no_sensitive_content`, `personal_data`,
+`credentials`, `confidential_data`, `regulated_data` and `uncertain`. It does not invent arbitrary
+target labels. A valid sensitive verdict adds `private`; a clear verdict cannot remove host or
+retained requirements. Uncertainty, invalid output, oversized input, a low clear score or a failed
+call requires `private` for the current request, without permanently retaining that precaution.
+Only an affirmative sensitive verdict becomes sticky when task retention is enabled.
+
+Before the classifier sees content, its target must satisfy all requirements already known from
+the host and task, as well as its privacy approval. For example, an EU-constrained request cannot
+be sent to a US-only classifier. Failure to find an eligible classifier must block the call.
+
+Generic LLM and typed decision classifiers remain alternatives, not consecutive judges. To combine
+one with the eligibility example, add either classifier block below. The eligibility table owns
+`accept_external_signal` and `restriction_scope`; the privacy table supplies only its classifier.
+Do not repeat the legacy privacy table's signal or task settings in a combined route.
 
 ```toml
 [targets.privacy_classifier]
 id = "internal-classifier"
-llm_client = "internal_endpoint"
-private = true
+llm_client = "eu_endpoint"
+labels = ["private", "eu"]
 
 [routes.coding.privacy.classifier]
 type = "llm"
 target = "privacy_classifier"
 clear_threshold = 0.90
 response_format_type = "json_schema"
-# prompt = "Your policy instructions."
 ```
+
+The typed alternative uses a decision target with the same approval labels:
 
 ```toml
 [decision_targets.privacy_decision]
 id = "internal-decision-model"
 decision_client = "internal_decisions"
-private = true
+labels = ["private", "eu"]
 
 [routes.coding.privacy.classifier]
 type = "decision"
 target = "privacy_decision"
 clear_threshold = 0.90
-# instructions = { policy = "Your policy instructions." }
 ```
 
-The generic path supports `json_schema` and `json_object`, with typed local verdict validation.
-Both include the schema in the prompt. Structural validation restricts opaque or oversized
-content before classification; it does not detect PII. The input borrows content-bearing request
-fields, including instructions, tools, extensions and preserved request bodies; it excludes transport
-metadata and cached responses. Remote MCP tool definitions are not assessed, so their transport
-credentials are not forwarded to the classifier. The serialized input is bounded to 64 KiB. Invalid output,
-oversized input, uncertainty, low clear scores and failed calls restrict the current request.
+The LLM client must declare `timeout_ms`. The LLM path supports `json_schema` and `json_object`,
+with the schema in the prompt and typed local validation. Custom prompts follow the shared
+contract, which rejects `{{RESPONSE_SCHEMA}}` placeholders because Switchyard supplies the schema.
+Structural validation bounds content before classification; it does not detect PII. Input includes
+content-bearing instructions, tools, extensions and preserved request bodies, but excludes transport metadata,
+cached responses and remote MCP tool definitions. Serialized input is bounded to 64 KiB.
 `clear_score` is a model score, not a calibrated guarantee of safety.
-
-The semantic adapter reuses libsy's private judge contract, request builder, decoder and
-`Driver`. Built-in pattern detectors are not included. Ownership of privacy categories and
-classifier prompts remains a team decision.
-
-## Task retention
-
-Set `restriction_scope = "task"` in the existing privacy table and supply
-`request.metadata.task_id`. Only explicit external restriction or a valid sensitive semantic
-verdict becomes sticky. A failure, invalid verdict, uncertainty or low clear score is reassessed
-next turn.
-
-Retention is process-local and limited to 4,096 restricted task IDs. There is no expiry, reset
-API or replica coordination. Missing/invalid task IDs and exhausted capacity restrict requests.
 
 ## Responsibilities and API impact
 
 | Component | Responsibility |
 |---|---|
-| Embedded application | Supply an external restriction and trusted task identity, if needed. |
-| Libsy | Check allowed model IDs; build and validate optional semantic judge calls. |
-| Runner | Filter configured targets, choose clients and auxiliaries, retain task restrictions. |
-| LLM client | Execute provider requests, retries and candidate fallbacks. |
+| Embedded application | Supply trusted required labels and task identity. |
+| Libsy | Enforce allowed model IDs; build and validate optional semantic judge calls. |
+| Runner | Prebuild eligible groups, bind their clients and auxiliaries, retain task requirements. |
+| LLM client | Execute provider requests, retries and eligible candidate fallbacks. |
 
-Direct Rust hosts can use `RuntimeModels::with_target_restriction()` and a matching
-`ClientRouter`. The guard covers `Driver`, the default `run_stream`, and `drive`, including
-rewritten steps from a custom stream. A custom stream consumer must enforce its own boundary.
-Model IDs do not distinguish deployments exposing the same model: the host must select the
-correct clients. This does not sandbox arbitrary Rust code or network calls made by the host.
+`RuntimeModels::with_target_restriction()` enforcement is unchanged: it covers `Driver`, the
+default `run_stream` and `drive`, including rewritten steps from a custom stream. A custom
+consumer must enforce its own boundary. Model IDs do not distinguish deployments exposing the
+same model, so hosts must bind the correct clients. This does not sandbox arbitrary Rust or
+network calls made by the host.
 
-The additive prototype APIs are `PrivacyPreflight`, `PrivacyAssessment`, and the restriction
-builder. Existing public signatures and the native plugin ABI are unchanged. Runner adds direct
-dependencies on existing workspace packages; no new package versions enter the lockfile.
-Generic judge helpers remain private.
+The additive generic API is `require_target_labels()`. Existing privacy APIs remain compatibility
+adapters: `PrivacyPreflight`, `PrivacyAssessment`, `mark_privacy_restricted()`, `PrivacyDecision`
+and `Route::execute_with_privacy_observer()`. No published Rust signature is removed or renamed;
+the protocol types, Python surface and native Relay plugin ABI are unchanged. No generic public
+observer was added for this slice. TOML labels and eligibility tables are additive. Generic judge
+helpers remain private. Runner uses existing workspace packages; this generalization introduces
+no new dependency versions.
 
-Target flags are internal configuration fields, not additions to public Rust types. There is
-no `restricted_targets` or `restricted_decision_target` table. A typed routing judge and its
-named candidates must be approved just like other callable targets. Aliases for the same
-model on the same client cannot disagree on the flag.
+Existing mixed-privacy restrictions on forwarded caller auth, prefill routing and OpenAI Responses
+continuation state are not relaxed. Embedded hosts must not reuse a broad client router's stored
+continuation across eligibility groups. Provider policies remain the deployment owner's responsibility.
 
-Mixed routes currently reject forwarded caller auth, prefill routing and OpenAI Responses
-continuation state. Direct embedded hosts must not reuse a broad client router's stored
-continuation across privacy lanes. A private target's provider policy remains the deployment
-owner's responsibility.
+## Branch ownership and validation
 
-## Validation
+The planned branch ownership below is not a claim that these local changes have been restacked:
 
-Focused coverage checks target filtering, positional weights, required roles, classifier
-approval, fallback enforcement and privacy marks on failed requests. Existing tests cover
-bounded context, malformed verdicts, thresholds, task retention and cancellation. Synthetic
-verdicts validate wiring, not classifier accuracy; no live provider benchmark was rerun for
-this configuration change.
+| Branch | Responsibility |
+|---|---|
+| #924 | Build finite eligible execution lanes and preserve router roles and target metadata. |
+| #926 | Add target labels, declared requirement sets and the trusted request helper. |
+| #929 / #930 | Compose typed / LLM privacy classification with the shared eligibility engine. |
+| #931 | Retain accumulated task requirements and recheck concurrent updates. |
+| #932 | Add bounded eligibility and classifier tracing. |
+| #933 | Preserve Relay privacy marks and the plugin ABI. |
 
-Classifier calls now use the standard libsy call spans and metrics. The INFO context span keeps
-route attribution; Relay privacy decision marks are unchanged. Buffered response IDs/models
-remain available. Abandoned calls use the existing `error` outcome rather than a separate
-`cancelled` label. Custom prompts follow the shared contract, which rejects
-`{{RESPONSE_SCHEMA}}` placeholders because Switchyard supplies the schema.
+Generalized tests must cover exact label matching, reordered requirement sets, role and weight
+preservation, unsupported requirement sets, private fallbacks and auxiliaries, and duplicate model
+IDs across clients. Task tests must cover sequential and concurrent unions, cancellation,
+capacity, invalid identity and requirements that stay retained after a no-eligible error.
+
+Existing classifier coverage checks bounded context, malformed verdicts, thresholds and cancellation;
+synthetic verdicts validate wiring, not classification accuracy. Classifier calls use standard libsy
+spans and metrics, with an INFO context span for route attribution and buffered response IDs/models.
+Abandoned calls retain the existing `error` outcome rather than a new `cancelled` label.
+
+Generic required labels currently appear only in DEBUG tracing. Relay's existing privacy marks
+are unchanged: lane, source, reason and optional classifier score/threshold, with no arbitrary
+`required_labels`. After successful admission, those marks survive subsequent execution failure.
+Generic eligibility decisions are not yet carried in Relay marks. This is a current telemetry
+gap; telemetry must never include request content.

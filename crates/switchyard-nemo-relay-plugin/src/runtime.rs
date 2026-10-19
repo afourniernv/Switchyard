@@ -998,8 +998,8 @@ mod tests {
             },
             "targets": {
                 "standard": {"id": "standard/model", "llm_client": "target"},
-                "restricted": {"id": "restricted/model", "llm_client": "target", "private": true},
-                "backup": {"id": "backup/model", "llm_client": "target", "private": true},
+                "restricted": {"id": "restricted/model", "llm_client": "target", "labels": ["private"]},
+                "backup": {"id": "backup/model", "llm_client": "target", "labels": ["private"]},
             },
             "routes": {
                 "privacy": {
@@ -1025,6 +1025,26 @@ mod tests {
             ),
         })
         .expect("privacy runtime should load")
+    }
+
+    fn privacy_request(runtime: &SwitchyardRuntime, is_streaming: Option<bool>) -> Request {
+        let mut request = RelayRequest {
+            headers: Map::new(),
+            content: json!({
+                "model": "switchyard/privacy",
+                "messages": [{"role": "user", "content": "hello"}],
+            }),
+        };
+        if let Some(is_streaming) = is_streaming {
+            request.content["stream"] = is_streaming.into();
+        }
+        runtime
+            .decode_request(
+                WireFormat::OpenAiChat,
+                request,
+                is_streaming.unwrap_or_default(),
+            )
+            .expect("privacy request should decode")
     }
 
     fn namespaced_responses_request() -> RelayRequest {
@@ -1100,19 +1120,7 @@ mod tests {
                 false,
             ),
         ] {
-            let mut request = runtime
-                .decode_request(
-                    WireFormat::OpenAiChat,
-                    RelayRequest {
-                        headers: Map::new(),
-                        content: json!({
-                            "model": "switchyard/privacy",
-                            "messages": [{"role": "user", "content": "hello"}],
-                        }),
-                    },
-                    false,
-                )
-                .expect("privacy request should decode");
+            let mut request = privacy_request(&runtime, None);
             if restricted {
                 switchyard_runner::mark_privacy_restricted(&mut request);
             }
@@ -1145,7 +1153,7 @@ mod tests {
 
     // Answer failures must not restore a public candidate, including on the streaming path.
     #[tokio::test]
-    async fn private_target_flags_restrict_buffered_and_streaming_fallbacks() {
+    async fn private_labels_restrict_buffered_and_streaming_fallbacks() {
         for streaming in [false, true] {
             let server = MockServer::start().await;
             Mock::given(body_partial_json(json!({"model": "restricted/model"})))
@@ -1178,20 +1186,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let runtime = privacy_runtime(&format!("{}/v1", server.uri()));
-            let mut request = runtime
-                .decode_request(
-                    WireFormat::OpenAiChat,
-                    RelayRequest {
-                        headers: Map::new(),
-                        content: json!({
-                            "model": "switchyard/privacy",
-                            "messages": [{"role": "user", "content": "hello"}],
-                            "stream": streaming,
-                        }),
-                    },
-                    streaming,
-                )
-                .expect("privacy request should decode");
+            let mut request = privacy_request(&runtime, Some(streaming));
             switchyard_runner::mark_privacy_restricted(&mut request);
             let events = if streaming {
                 let execution = runtime

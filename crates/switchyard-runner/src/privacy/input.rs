@@ -36,9 +36,11 @@ impl Scan {
             preservation,
         } = request;
         for instruction in instructions {
+            self.step(0)?;
             self.blocks(&instruction.content, 0)?;
         }
         for message in messages {
+            self.step(0)?;
             self.blocks(&message.content, 0)?;
         }
         for tool in tools {
@@ -181,7 +183,7 @@ impl Scan {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use switchyard_protocol::{ImageSource, McpContent, Message, Role, ToolCall};
+    use switchyard_protocol::{ImageSource, InstructionBlock, McpContent, Message, Role, ToolCall};
 
     use super::*;
 
@@ -283,6 +285,29 @@ mod tests {
             serde_json::Value::Array(vec![serde_json::Value::Null; MAX_SCAN_STEPS]),
         );
         for request in [&oversized, &too_deep, &too_many] {
+            assert_eq!(validate_input(request), Err("scan_limit"));
+        }
+    }
+
+    #[test]
+    fn bounds_empty_message_and_instruction_containers() {
+        let mut messages = Request::default();
+        messages.llm_request.messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![],
+            };
+            MAX_SCAN_STEPS + 1
+        ];
+        let mut instructions = Request::default();
+        instructions.llm_request.instructions = vec![
+            InstructionBlock {
+                role: Role::System,
+                content: vec![],
+            };
+            MAX_SCAN_STEPS + 1
+        ];
+        for request in [&messages, &instructions] {
             assert_eq!(validate_input(request), Err("scan_limit"));
         }
     }
