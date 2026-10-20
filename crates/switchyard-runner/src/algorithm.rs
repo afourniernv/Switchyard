@@ -734,6 +734,7 @@ impl StageClassifierConfig {
 
 impl AlgorithmSpec {
     /// Whether this configuration only selects a model, with state owned by the caller.
+    #[cfg(feature = "client")]
     pub(crate) fn supports_model_selection(&self) -> bool {
         match self {
             Self::Passthrough {
@@ -748,6 +749,7 @@ impl AlgorithmSpec {
         }
     }
 
+    #[cfg(feature = "client")]
     pub(crate) fn decision_judge(&self) -> Option<(&str, &DecisionJudgeRouteConfig)> {
         match self {
             Self::LlmClassifier { config, .. } => config
@@ -1007,6 +1009,7 @@ impl AlgorithmSpec {
     }
 
     /// Response target and routing-only dependency for routers that answer while routing.
+    #[cfg(feature = "client")]
     pub(crate) fn routing_response_and_dependency(&self) -> Option<(&str, &str)> {
         match self {
             Self::LlmClassifier { config, .. }

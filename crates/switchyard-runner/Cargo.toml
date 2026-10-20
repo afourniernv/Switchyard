@@ -14,15 +14,17 @@ rust-version.workspace = true
 publish = ["crates-io"]
 
 [features]
+default = ["client"]
+client = ["dep:reqwest", "dep:switchyard-llm-client"]
 prefill-router = ["dep:prefill-router"]
 
 [dependencies]
 libsy = { package = "switchyard-libsy", path = "../libsy", version = "0.3.0" }
 prefill-router = { workspace = true, optional = true }
-reqwest.workspace = true
+reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-switchyard-llm-client.workspace = true
+switchyard-llm-client = { workspace = true, optional = true }
 switchyard-protocol.workspace = true
 strum_macros.workspace = true
 thiserror.workspace = true
@@ -33,3 +35,11 @@ tracing.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
+
+[[test]]
+name = "route"
+required-features = ["client"]
+
+[[test]]
+name = "model_selection"
+required-features = ["client"]

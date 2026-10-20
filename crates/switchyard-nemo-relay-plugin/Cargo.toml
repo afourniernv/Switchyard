@@ -23,7 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 switchyard-llm-client.workspace = true
 switchyard-protocol.workspace = true
-switchyard-runner.workspace = true
+switchyard-runner = { workspace = true, features = ["client"] }
 switchyard-translation.workspace = true
 tokio.workspace = true
 toml = "1.1"

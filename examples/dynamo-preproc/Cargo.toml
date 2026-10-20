@@ -22,7 +22,7 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-switchyard-runner.workspace = true
+switchyard-runner = { workspace = true, features = ["client"] }
 switchyard-protocol.workspace = true
 switchyard-translation.workspace = true
 anyhow = "1"
@@ -32,7 +32,7 @@ futures-util.workspace = true
 http.workspace = true
 envoy-types = "=0.6.1"
 serde_json = { workspace = true, features = ["raw_value"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 tonic = "0.13.1"
 thiserror.workspace = true
 tracing.workspace = true
