@@ -6,6 +6,7 @@ package switchyard
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,16 @@ func TestMessageRetention(t *testing.T) {
 // A routing deadline must expire while its host call is still pending.
 func TestRoutingDeadline(t *testing.T) {
 	router := newRouter(t, `{"type":"vgr","local_target":"weak","cloud_target":"strong","mode":"evaluate","deadline_seconds":0.02,"task_typing":false}`)
+	for range 4 {
+		t.Run("request", func(t *testing.T) {
+			t.Parallel()
+			testRoutingDeadline(t, router)
+		})
+	}
+}
+
+func testRoutingDeadline(t *testing.T, router *Router) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	hostFinished := make(chan struct{})
@@ -70,5 +81,50 @@ func TestRoutingDeadline(t *testing.T) {
 	}
 	if elapsed >= 200*time.Millisecond {
 		t.Fatal("routing waited for the host instead of its configured deadline")
+	}
+}
+
+// Waiting for a provider must leave the shared guest available to other requests.
+func TestConcurrentHostCalls(t *testing.T) {
+	router := newRouter(t, composite)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			outcome, err := router.Route(ctx, input(), func(ctx context.Context, _ Work) (Reply, error) {
+				started <- struct{}{}
+				select {
+				case <-release:
+					return Reply{Response: json.RawMessage(judgeAnswer)}, nil
+				case <-ctx.Done():
+					return Reply{}, ctx.Err()
+				}
+			})
+			if err == nil && (len(outcome.SelectedModelIDs) == 0 || outcome.SelectedModelIDs[0] != "weak-model") {
+				err = fmt.Errorf("unexpected outcome: %+v", outcome)
+			}
+			results <- err
+		}()
+	}
+	for range 2 {
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatal("host calls did not overlap")
+		}
+	}
+	close(release)
+	for range 2 {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("concurrent routes did not finish")
+		}
 	}
 }

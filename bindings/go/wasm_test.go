@@ -16,35 +16,40 @@ import (
 
 func TestWasmTrapIsolatesAndReplacesInstance(t *testing.T) {
 	config := testConfig(`{"type":"stage_router","picker":"efficient_first",` + stage + `}`)
-	backend, err := newWasmBackendWithPoolSize(config, 2)
+	backend, err := newWasmBackend(config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer backend.close()
+	otherBackend, err := newWasmBackend(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherBackend.close()
 	input, err := json.Marshal(input())
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	first, err := backend.slots[0].startRun(ctx, input)
+	first, err := backend.slot.startRun(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.close()
-	second, err := backend.slots[0].startRun(ctx, input)
+	second, err := backend.slot.startRun(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer second.close()
-	other, err := backend.slots[1].startRun(ctx, input)
+	other, err := otherBackend.slot.startRun(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer other.close()
 
-	backend.slots[0].mu.Lock()
+	backend.slot.mu.Lock()
 	_, allocationErr := first.gen.guest.call(ctx, "sy_alloc", uint64(^uint32(0)))
-	backend.slots[0].mu.Unlock()
+	backend.slot.mu.Unlock()
 	if !isWasmTrap(allocationErr) {
 		t.Fatalf("forced guest allocation panic returned %v", allocationErr)
 	}
@@ -63,9 +68,9 @@ func TestWasmTrapIsolatesAndReplacesInstance(t *testing.T) {
 		t.Fatalf("unrelated run returned %s", step)
 	}
 
-	replacement, err := backend.slots[0].startRun(ctx, input)
+	replacement, err := backend.slot.startRun(ctx, input)
 	if err != nil {
-		t.Fatalf("pool did not replace the trapped instance: %v", err)
+		t.Fatalf("router did not replace the trapped instance: %v", err)
 	}
 	defer replacement.close()
 	step, err = replacement.next(ctx)
@@ -76,22 +81,27 @@ func TestWasmTrapIsolatesAndReplacesInstance(t *testing.T) {
 
 func TestWasmClosedInstanceIsReplaced(t *testing.T) {
 	config := testConfig(`{"type":"stage_router","picker":"efficient_first",` + stage + `}`)
-	backend, err := newWasmBackendWithPoolSize(config, 2)
+	backend, err := newWasmBackend(config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer backend.close()
+	otherBackend, err := newWasmBackend(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherBackend.close()
 	input, err := json.Marshal(input())
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	closedRun, err := backend.slots[0].startRun(ctx, input)
+	closedRun, err := backend.slot.startRun(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closedRun.close()
-	otherRun, err := backend.slots[1].startRun(ctx, input)
+	otherRun, err := otherBackend.slot.startRun(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +116,7 @@ func TestWasmClosedInstanceIsReplaced(t *testing.T) {
 	if err != nil || !strings.Contains(string(step), `"type":"done"`) {
 		t.Fatalf("unrelated instance returned step=%s err=%v", step, err)
 	}
-	replacement, err := backend.slots[0].startRun(ctx, input)
+	replacement, err := backend.slot.startRun(ctx, input)
 	if err != nil {
 		t.Fatalf("closed instance was not replaced: %v", err)
 	}
@@ -119,7 +129,7 @@ func TestWasmClosedInstanceIsReplaced(t *testing.T) {
 
 // A caller's expired context must not close an instance that other runs share.
 func TestWasmCancelledRunKeepsSharedInstance(t *testing.T) {
-	backend, err := newWasmBackendWithPoolSize(json.RawMessage(`{"algorithm":`+composite+`,"targets":{"weak":"weak-model","strong":"strong-model","judge":"judge-model"}}`), 1)
+	backend, err := newWasmBackend(json.RawMessage(`{"algorithm":` + composite + `,"targets":{"weak":"weak-model","strong":"strong-model","judge":"judge-model"}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,12 +167,12 @@ func TestWasmCancelledRunKeepsSharedInstance(t *testing.T) {
 }
 
 func TestWasmTrapIncludesGuestPanicMessage(t *testing.T) {
-	backend, err := newWasmBackendWithPoolSize(testConfig(`{"type":"stage_router","picker":"efficient_first",`+stage+`}`), 1)
+	backend, err := newWasmBackend(testConfig(`{"type":"stage_router","picker":"efficient_first",` + stage + `}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer backend.close()
-	slot := backend.slots[0]
+	slot := backend.slot
 	slot.mu.Lock()
 	_, err = slot.gen.guest.call(context.Background(), "sy_alloc", uint64(^uint32(0)))
 	slot.mu.Unlock()
@@ -171,19 +181,21 @@ func TestWasmTrapIncludesGuestPanicMessage(t *testing.T) {
 	}
 }
 
-// Reading while a host call is unanswered must report a pending step, not block or trap.
+// Pending calls and same-session waiters yield without blocking other runs.
 func TestWasmNextWhileHostCallPending(t *testing.T) {
-	backend, err := newWasmBackendWithPoolSize(json.RawMessage(`{"algorithm":`+composite+`,"targets":{"weak":"weak-model","strong":"strong-model","judge":"judge-model"}}`), 1)
+	backend, err := newWasmBackend(json.RawMessage(`{"algorithm":` + composite + `,"targets":{"weak":"weak-model","strong":"strong-model","judge":"judge-model"}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer backend.close()
-	data, err := json.Marshal(input())
+	request := input()
+	request.Metadata = &RequestMetadata{SessionID: "shared"}
+	data, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	run, err := backend.slots[0].startRun(ctx, data)
+	run, err := backend.slot.startRun(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,6 +206,25 @@ func TestWasmNextWhileHostCallPending(t *testing.T) {
 	}
 	if step, err := run.next(ctx); err != nil || step != nil {
 		t.Fatalf("read with an unanswered call returned step=%s err=%v", step, err)
+	}
+	waiting, err := backend.slot.startRun(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if step, err := waiting.next(ctx); err != nil || step != nil {
+		waiting.close()
+		t.Fatalf("same-session waiter returned step=%s err=%v", step, err)
+	}
+	waiting.close()
+	var work Work
+	if err := json.Unmarshal(step, &work); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.respond(ctx, work.ID, []byte(`{"response":`+judgeAnswer+`}`)); err != nil {
+		t.Fatal(err)
+	}
+	if step, err := run.next(ctx); err != nil || !strings.Contains(string(step), `"type":"done"`) {
+		t.Fatalf("surviving run returned step=%s err=%v", step, err)
 	}
 }
 
@@ -215,19 +246,4 @@ func TestWasmTranslatorIsReplacedAfterFailure(t *testing.T) {
 	if _, err := wasmTranslate("sy_decode_request", input); err != nil {
 		t.Fatalf("translator was not replaced: %v", err)
 	}
-}
-
-func TestWasmInstanceMemory(t *testing.T) {
-	config := testConfig(`{"type":"stage_router","picker":"efficient_first",` + stage + `}`)
-	backend, err := newWasmBackendWithPoolSize(config, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer backend.close()
-	first := backend.slots[0].gen.guest.module.Memory().Size()
-	second := backend.slots[1].gen.guest.module.Memory().Size()
-	if first == 0 || second != first {
-		t.Fatalf("guest memory sizes are %d and %d", first, second)
-	}
-	t.Logf("guest_linear_memory_bytes_per_instance=%d", first)
 }

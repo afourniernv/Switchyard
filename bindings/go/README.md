@@ -98,9 +98,13 @@ the final selected provider response separately.
 
 `Route` waits in its calling goroutine. A host that needs immediate return can
 call it in a goroutine; waiting for routing steps does not occupy a blocked
-native-reader thread. Concurrent routes share one router. The WASM backend uses
-a pool of instances and keeps each session on the same instance to retain routing
-state. A trapped instance is replaced; retained state in that instance is lost.
+native-reader thread. Each WASM router shares one guest instance, so Switchyard
+owns its session state. Guest calls are serialized; host callbacks can overlap.
+CPU-bound throughput is lower than with separate guests.
+A trap fails every active run on that router. Its instance is replaced and retained state is lost.
+
+While a WASM run is idle, Go re-enters it every 5 ms to advance Rust timers and
+session waiters. Deadline handling can be delayed by that interval and scheduling load.
 
 Host callbacks may run concurrently and must honor their context. Cancellation
 stops routing and cancels the host context, but cannot forcibly stop Go code that

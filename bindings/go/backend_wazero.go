@@ -10,17 +10,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
-	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type wasmBackend struct {
 	runtime   *wasmRuntime
-	slots     []*wasmSlot
-	next      atomic.Uint64
+	slot      *wasmSlot
 	active    atomic.Int64
 	closed    atomic.Bool
 	lifecycle sync.Mutex
@@ -66,26 +63,20 @@ type wasmRun struct {
 }
 
 func newBackend(config json.RawMessage) (engineBackend, error) {
-	return newWasmBackendWithPoolSize(config, runtime.GOMAXPROCS(0))
+	return newWasmBackend(config)
 }
 
-func newWasmBackendWithPoolSize(config json.RawMessage, size int) (*wasmBackend, error) {
-	if size < 1 {
-		return nil, errors.New("Switchyard wasm instance pool must have at least one instance")
-	}
+func newWasmBackend(config json.RawMessage) (*wasmBackend, error) {
 	runtime, err := newWasmRuntime()
 	if err != nil {
 		return nil, err
 	}
-	backend := &wasmBackend{runtime: runtime, slots: make([]*wasmSlot, size)}
-	for index := range backend.slots {
-		slot := &wasmSlot{owner: backend, config: bytesClone(config)}
-		slot.gen, err = backend.newGeneration(context.Background(), slot.config)
-		if err != nil {
-			backend.close()
-			return nil, fmt.Errorf("initialize Switchyard wasm instance %d: %w", index, err)
-		}
-		backend.slots[index] = slot
+	backend := &wasmBackend{runtime: runtime}
+	backend.slot = &wasmSlot{owner: backend, config: bytesClone(config)}
+	backend.slot.gen, err = backend.newGeneration(context.Background(), backend.slot.config)
+	if err != nil {
+		backend.close()
+		return nil, fmt.Errorf("initialize Switchyard wasm instance: %w", err)
 	}
 	return backend, nil
 }
@@ -189,7 +180,7 @@ func (generation *wasmGeneration) next(ctx context.Context, run uint32) ([]byte,
 		return nil, errors.New("Switchyard wasm next step is outside guest memory")
 	}
 	if ptr == 0 {
-		// The run is waiting on host replies.
+		// The runtime is idle.
 		return nil, nil
 	}
 	output, err := generation.guest.readCString(ptr)
@@ -233,14 +224,9 @@ func (backend *wasmBackend) close() {
 
 func (backend *wasmBackend) finalizeClose() {
 	backend.finalize.Do(func() {
-		for _, slot := range backend.slots {
-			if slot == nil {
-				continue
-			}
-			slot.mu.Lock()
-			slot.closeLocked(errors.New("Switchyard router is closed"))
-			slot.mu.Unlock()
-		}
+		backend.slot.mu.Lock()
+		backend.slot.closeLocked(errors.New("Switchyard router is closed"))
+		backend.slot.mu.Unlock()
 		backend.runtime.closeAll()
 	})
 }
@@ -298,8 +284,7 @@ func (backend *wasmBackend) route(ctx context.Context, input Input, call HostCal
 	if err != nil {
 		return Outcome{}, err
 	}
-	slot := backend.slotFor(input)
-	run, err := slot.startRun(ctx, data)
+	run, err := backend.slot.startRun(ctx, data)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -307,7 +292,7 @@ func (backend *wasmBackend) route(ctx context.Context, input Input, call HostCal
 	// Host calls run concurrently, as on the native backend; replies are delivered
 	// whenever the guest reports that it needs one to progress.
 	replies := make(chan wasmHostReply)
-	pending := 0
+	var wake <-chan time.Time
 	for {
 		if err := ctx.Err(); err != nil {
 			return Outcome{}, err
@@ -320,16 +305,25 @@ func (backend *wasmBackend) route(ctx context.Context, input Input, call HostCal
 			return Outcome{}, err
 		}
 		if stepData == nil {
-			if pending == 0 {
-				return Outcome{}, errors.New("Switchyard wasm run is waiting without a host call")
+			if wake == nil {
+				// Re-enter the guest so Rust timers and shared session state can progress.
+				timer := time.NewTicker(5 * time.Millisecond)
+				defer timer.Stop()
+				wake = timer.C
 			}
-			reply, err := run.awaitReply(replies)
-			if err != nil {
-				return Outcome{}, err
-			}
-			pending--
-			if err := run.deliver(ctx, reply); err != nil {
-				return Outcome{}, err
+			select {
+			case reply := <-replies:
+				if err := run.deliver(ctx, reply); err != nil {
+					return Outcome{}, err
+				}
+			case <-wake:
+			case <-run.ctx.Done():
+				if err := run.gen.error(); err != nil {
+					return Outcome{}, err
+				}
+				return Outcome{}, run.ctx.Err()
+			case <-run.gen.done:
+				return Outcome{}, run.gen.error()
 			}
 			continue
 		}
@@ -356,73 +350,10 @@ func (backend *wasmBackend) route(ctx context.Context, input Input, call HostCal
 			}
 			work := Work{Type: step.Type, ID: step.ID, Models: step.Models, Model: step.Model, Request: step.Request}
 			go run.hostCall(call, work, replies)
-			pending++
 		default:
 			return Outcome{}, errors.New("unknown Switchyard step: " + step.Type)
 		}
 	}
-}
-
-func (backend *wasmBackend) slotFor(input Input) *wasmSlot {
-	if metadata := input.Metadata; metadata != nil && metadata.SessionID != "" {
-		key := "session\x00" + metadata.SessionID
-		if metadata.IsSubagent {
-			if metadata.AgentID == "" {
-				key = ""
-			} else {
-				key = "subagent\x00" + metadata.SessionID + "\x00" + metadata.AgentID
-			}
-		}
-		if key != "" {
-			return backend.slotForKey(key)
-		}
-	}
-	// Mirrors libsy's message-hash fallback in retention_key so requests that libsy keys
-	// together share one instance, and with it the state retained under that key.
-	if input.Metadata == nil || !input.Metadata.IsSubagent {
-		if text, ok := firstUserText(input.Request); ok {
-			return backend.slotForKey("message\x00" + text)
-		}
-	}
-	index := backend.next.Add(1) - 1
-	return backend.slots[index%uint64(len(backend.slots))]
-}
-
-func (backend *wasmBackend) slotForKey(key string) *wasmSlot {
-	hash := fnv.New64a()
-	_, _ = hash.Write([]byte(key))
-	return backend.slots[hash.Sum64()%uint64(len(backend.slots))]
-}
-
-// firstUserText matches libsy's Message::text_content("") on the first user message.
-func firstUserText(request json.RawMessage) (string, bool) {
-	var parsed struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"messages"`
-	}
-	if json.Unmarshal(request, &parsed) != nil {
-		return "", false
-	}
-	for _, message := range parsed.Messages {
-		if message.Role != "user" {
-			continue
-		}
-		var text strings.Builder
-		found := false
-		for _, block := range message.Content {
-			if block.Type == "text" || block.Type == "refusal" {
-				text.WriteString(block.Text)
-				found = true
-			}
-		}
-		return text.String(), found
-	}
-	return "", false
 }
 
 func (slot *wasmSlot) startRun(ctx context.Context, input []byte) (*wasmRun, error) {
@@ -514,20 +445,6 @@ func (run *wasmRun) hostCall(call HostCall, work Work, replies chan<- wasmHostRe
 	select {
 	case replies <- wasmHostReply{work.ID, reply, err}:
 	case <-run.ctx.Done():
-	}
-}
-
-func (run *wasmRun) awaitReply(replies <-chan wasmHostReply) (wasmHostReply, error) {
-	select {
-	case reply := <-replies:
-		return reply, nil
-	case <-run.ctx.Done():
-		if err := run.gen.error(); err != nil {
-			return wasmHostReply{}, err
-		}
-		return wasmHostReply{}, run.ctx.Err()
-	case <-run.gen.done:
-		return wasmHostReply{}, run.gen.error()
 	}
 }
 
