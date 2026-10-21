@@ -43,6 +43,6 @@ uuid.workspace = true
 [dev-dependencies]
 # SDK + in-memory exporter to assert what the observability layer records.
 opentelemetry_sdk = { version = "0.32", features = ["metrics", "testing", "trace"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing-subscriber.workspace = true
 http.workspace = true
