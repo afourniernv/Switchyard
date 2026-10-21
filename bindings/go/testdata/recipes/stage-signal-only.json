@@ -1,0 +1,42 @@
+{
+  "algorithm": {
+    "type": "stage_router",
+    "capable_target": "capable",
+    "efficient_target": "efficient",
+    "confidence_threshold": 0.5,
+    "recent_turn_window": 3,
+    "capable_hold_turns": 2,
+    "picker": "efficient_first"
+  },
+  "targets": {
+    "capable": "deployment-a",
+    "efficient": "deployment-b",
+    "answer_02": "deployment-c",
+    "answer_03": "deployment-d",
+    "answer_04": "deployment-e",
+    "answer_05": "deployment-f",
+    "answer_06": "deployment-g",
+    "answer_07": "deployment-h",
+    "answer_08": "deployment-i",
+    "answer_09": "deployment-j",
+    "answer_10": "deployment-k",
+    "answer_11": "deployment-l",
+    "answer_12": "deployment-m",
+    "answer_13": "deployment-n",
+    "answer_14": "deployment-o",
+    "answer_15": "deployment-p",
+    "answer_16": "deployment-q",
+    "answer_17": "deployment-r",
+    "answer_18": "deployment-s",
+    "answer_19": "deployment-t",
+    "answer_20": "deployment-u",
+    "answer_21": "deployment-v",
+    "answer_22": "deployment-w",
+    "answer_23": "deployment-x",
+    "answer_24": "deployment-y",
+    "answer_25": "deployment-z",
+    "answer_26": "deployment-26",
+    "answer_27": "deployment-27",
+    "judge": "judge-model"
+  }
+}

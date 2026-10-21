@@ -19,7 +19,7 @@ crate-type = ["cdylib"]
 napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt", "dyn-symbols"] }
 napi-derive = "3"
 serde_json.workspace = true
-switchyard-runner.workspace = true
+switchyard-runner = { workspace = true, features = ["client"] }
 switchyard-protocol.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }

@@ -14,5 +14,5 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 switchyard-protocol.workspace = true
-switchyard-runner.workspace = true
-tokio.workspace = true
+switchyard-runner = { workspace = true, features = ["client"] }
+tokio = { workspace = true, features = ["full"] }

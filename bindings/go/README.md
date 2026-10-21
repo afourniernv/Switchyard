@@ -1,27 +1,75 @@
 # Embedded Go routing
 
 Run Switchyard algorithms in a Go host that owns model eligibility, credentials,
-provider calls, and retries. These bindings call libsy through the C ABI; they do
+provider calls, and retries. The bindings run libsy in the same process. They do
 not start a server.
+
+## Backends
+
+The package has two backends. Both run the same algorithms and return the same
+outcomes.
+
+- **WASM** is the default. It runs libsy as WebAssembly with
+  [wazero](https://wazero.io). It is pure Go, so it needs no cgo, C compiler, or
+  Rust toolchain. The module is embedded in the package.
+- **Native** links libsy as a static C library through cgo. It is faster, but
+  you must build the library yourself.
+
+`New` uses native when the package was built with it, and WASM otherwise. Use
+`WithEngine` to choose one:
+
+```go
+router, err := switchyard.New(config, switchyard.WithEngine(switchyard.WASM))
+```
+
+`switchyard.Auto` is the default. `switchyard.Native` returns an error if the
+package was built without the native backend.
 
 ## Build and test
 
-Requires Go 1.22+, cgo, a C compiler, and the repository's Rust toolchain. Build
-the native library for the same platform as the Go host:
+Requires Go 1.25 or newer, as set in `go.mod`.
+
+Test the WASM backend:
 
 ```sh
-cargo build -p switchyard-ffi --locked
 cd bindings/go
-go test -race ./...
-GOEXPERIMENT=cgocheck2 go test -race ./...
-go vet ./...
+go test ./...
 ```
 
-The package links the local `target/debug` library. For another build location,
-set `CGO_LDFLAGS` with its library search path and configure the runtime loader.
-Rebuild Go with `go test -a` after changing the C header or native library; Go's
-cache does not track headers outside the package directory. Native artifacts
-are not downloaded or published by this package.
+The native backend needs cgo, a C compiler, and the repository's Rust toolchain.
+Build the library, then test with the `switchyard_native` build tag:
+
+```sh
+cargo build --release -p switchyard-ffi --locked
+cd bindings/go
+go test -tags switchyard_native ./...
+```
+
+The tag links `target/release/libswitchyard_ffi.a` from this repository. Build
+the library for the same platform as the Go host. Run `go test -a` after you
+change the C header or the library. Go's build cache does not track files
+outside the package directory.
+
+## Rebuild the WASM module
+
+The module lives in `internal/wasm/switchyard.wasm`. Rebuild it after you change
+any Rust code it uses:
+
+```sh
+scripts/build-go-wasm.sh
+```
+
+The script uses the toolchain in `rust-toolchain.toml` and adds the
+`wasm32-wasip1` target. It writes three files:
+
+- `switchyard.wasm`: the module.
+- `switchyard.wasm.sha256`: its SHA-256 checksum. `TestEmbeddedWasmChecksum`
+  fails if the checksum and the embedded module differ.
+- `switchyard.wasm.inputs`: a hash of the source files used to build it. CI runs
+  `scripts/go-wasm-inputs.sh` and fails if this hash is out of date.
+
+The module bytes depend on the build host, so a rebuild on another machine can
+change them. Commit all three files together.
 
 ## Use
 
@@ -70,13 +118,19 @@ the final selected provider response separately.
 ## Cancellation and ownership
 
 `Route` waits in its calling goroutine. A host that needs immediate return can
-call it in a goroutine; waiting for routing steps does not occupy a blocked
-native-reader thread. Concurrent routes share one router.
+call it in a goroutine. Concurrent routes share one router.
 
-Host callbacks may run concurrently and must honor their context. Cancellation
-stops the native run and cancels the host context, but cannot forcibly stop Go
-code that ignores it. Late host results cannot access the freed native run.
-Host errors cross the boundary as messages, not concrete Go error types.
+Host callbacks may run concurrently on both backends and must honor their
+context. Cancellation stops the run and cancels the host context, but cannot
+forcibly stop Go code that ignores it. Late host results cannot access the freed
+run. Host errors cross the boundary as messages, not concrete Go error types.
+
+The WASM backend keeps a pool of module instances, one per `GOMAXPROCS`.
+Requests with the same session ID go to the same instance, so state kept per
+session stays together. Requests without a session ID are grouped by their first
+user message. A caller's cancelled context ends only its own route. If an
+instance traps, its routes fail with the guest's panic message, and the next
+route gets a new instance.
 
 `Close` prevents new runs; existing runs retain their algorithm and finish under
 their own contexts. Cancel those contexts to stop them. Router value copies
@@ -84,6 +138,6 @@ share closed state, and repeated `Close` calls are safe. Native callback handles
 are released only after native cleanup has waited for callbacks to return.
 Call `Close` when finished; Go garbage collection does not release the router.
 
-`New` checks ABI generation 1 against the linked library. Scope session and agent
+`New` checks ABI generation 1 against the backend. Scope session and agent
 IDs to the host's tenant and conversation. `Input.Metadata` and
 `Input.SubagentModels` carry routing context separately from provider requests.
