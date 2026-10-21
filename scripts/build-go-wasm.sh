@@ -25,17 +25,3 @@ rust_commit="$(rustc "+$toolchain" -vV | sed -n 's/^commit-hash: //p')"
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$repo_root=/switchyard --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$rust_src=/rustc/$rust_commit"
 cargo "+$toolchain" build --locked --release --target wasm32-wasip1 -p switchyard-ffi --lib
 cp "$repo_root/target/wasm32-wasip1/release/switchyard_ffi.wasm" "$wasm_path"
-if command -v sha256sum >/dev/null; then
-	sha256sum "$wasm_path" | awk '{ print $1 "  switchyard.wasm" }' > "$wasm_path.sha256"
-else
-	shasum -a 256 "$wasm_path" | awk '{ print $1 "  switchyard.wasm" }' > "$wasm_path.sha256"
-fi
-"$script_dir/go-wasm-inputs.sh" > "$wasm_path.inputs"
-
-if [[ "${WASM_OPT:-0}" == "1" ]]; then
-	command -v wasm-opt >/dev/null || {
-		printf 'WASM_OPT=1 requires wasm-opt in PATH\n' >&2
-		exit 1
-	}
-	wasm-opt -Oz "$wasm_path" -o "$wasm_dir/switchyard.opt.wasm"
-fi

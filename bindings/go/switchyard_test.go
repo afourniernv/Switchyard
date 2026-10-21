@@ -18,11 +18,12 @@ import (
 
 const stage = `"capable_target":"strong","efficient_target":"weak","confidence_threshold":0.5`
 const composite = `{"type":"composite","classifier":{"target":"judge","base_threshold":0.5,"classify_trigger":"user_turn","fail_open":false},"stage":{` + stage + `}}`
+const decision = `{"type":"composite","classifier":{"target":"judge","classify_trigger":"user_turn","fail_open":false,"decision":{"cutoff":0.5,"candidates":{"a":"strong","b":"weak"},"evidence":{}}},"stage":{` + stage + `}}`
 const judgeAnswer = `{"model":"provider-model","outputs":[{"role":"assistant","content":[{"type":"text","text":"{\"crux\":\"bounded task\",\"primary_rule\":\"SUP-1\",\"capability_boundary\":\"supported\",\"p_solve\":0.9}"}],"stop_reason":"end_turn"}]}`
 
-func newRouter(t *testing.T, engine Engine, algorithm string) *Router {
+func newRouter(t *testing.T, algorithm string) *Router {
 	t.Helper()
-	router, err := New(testConfig(algorithm), WithEngine(engine))
+	router, err := New(testConfig(algorithm))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,10 +43,6 @@ func input() Input {
 
 // Selection retains eligible targets and Stage's prepared request across the codecs.
 func TestSelectionAndTranslation(t *testing.T) {
-	forEachEngine(t, testSelectionAndTranslation)
-}
-
-func testSelectionAndTranslation(t *testing.T, engine Engine) {
 	type chatRequest struct {
 		Model    string
 		Store    *bool
@@ -60,7 +57,7 @@ func testSelectionAndTranslation(t *testing.T, engine Engine) {
 		{"escalation", `{"type":"stage_router","picker":"efficient_first",` + stage + `,"handoff_notes":{"escalation_note":"Review the failure"}}`, "strong-model", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			router := newRouter(t, engine, tc.algorithm)
+			router := newRouter(t, tc.algorithm)
 			request := input()
 			if tc.name == "random" {
 				request.Models["any"] = []string{"weak-model"}
@@ -119,11 +116,6 @@ func testSelectionAndTranslation(t *testing.T, engine Engine) {
 
 // Both judge protocols use Go's client; missing clients and host failures remain errors.
 func TestCompositeHostCalls(t *testing.T) {
-	forEachEngine(t, testCompositeHostCalls)
-}
-
-func testCompositeHostCalls(t *testing.T, engine Engine) {
-	decision := `{"type":"composite","classifier":{"target":"judge","classify_trigger":"user_turn","fail_open":false,"decision":{"cutoff":0.5,"candidates":{"a":"strong","b":"weak"},"evidence":{}}},"stage":{` + stage + `}}`
 	for _, tc := range []struct {
 		name, algorithm, kind, selected, response, invalidResponse string
 	}{
@@ -131,7 +123,7 @@ func testCompositeHostCalls(t *testing.T, engine Engine) {
 		{"decision", decision, "call_decision", "strong-model", `{"answers":{"route":{"value":{"type":"choice","data":{"selected":"advantage","probabilities":{"advantage":0.9,"no_advantage":0.1}}}}}}`, `{"answers":"wrong"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			router := newRouter(t, engine, tc.algorithm)
+			router := newRouter(t, tc.algorithm)
 			calls := 0
 			outcome, err := router.Route(context.Background(), input(), func(_ context.Context, work Work) (Reply, error) {
 				calls++
@@ -168,29 +160,22 @@ func testCompositeHostCalls(t *testing.T, engine Engine) {
 
 // Host failures remain subject to the algorithm's configured recovery policy.
 func TestHostFailureUsesAlgorithmPolicy(t *testing.T) {
-	forEachEngine(t, testHostFailureUsesAlgorithmPolicy)
-}
-
-func testHostFailureUsesAlgorithmPolicy(t *testing.T, engine Engine) {
-	algorithm := strings.Replace(composite, `"fail_open":false`, `"fail_open":true`, 1)
-	router := newRouter(t, engine, algorithm)
-	calls := 0
-	outcome, err := router.Route(context.Background(), input(), func(context.Context, Work) (Reply, error) {
-		calls++
-		return Reply{}, errors.New("judge unavailable")
-	})
-	if err != nil || calls != 1 || !slices.Equal(outcome.SelectedModelIDs, []string{"weak-model", "strong-model"}) {
-		t.Fatalf("calls=%d outcome=%+v err=%v", calls, outcome, err)
+	for _, algorithm := range []string{composite, decision} {
+		router := newRouter(t, strings.Replace(algorithm, `"fail_open":false`, `"fail_open":true`, 1))
+		calls := 0
+		outcome, err := router.Route(context.Background(), input(), func(context.Context, Work) (Reply, error) {
+			calls++
+			return Reply{}, errors.New("judge unavailable")
+		})
+		if err != nil || calls != 1 || !slices.Equal(outcome.SelectedModelIDs, []string{"weak-model", "strong-model"}) {
+			t.Fatalf("calls=%d outcome=%+v err=%v", calls, outcome, err)
+		}
 	}
 }
 
-// Cancellation releases native work even if a host ignores its context and replies later.
+// Cancellation releases routing work even if a host ignores its context and replies later.
 func TestCancellationAndLateHostReply(t *testing.T) {
-	forEachEngine(t, testCancellationAndLateHostReply)
-}
-
-func testCancellationAndLateHostReply(t *testing.T, engine Engine) {
-	router := newRouter(t, engine, composite)
+	router := newRouter(t, composite)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -223,7 +208,7 @@ func testCancellationAndLateHostReply(t *testing.T, engine Engine) {
 		t.Fatal("cancellation waited for host code")
 	}
 	runtime.GC()
-	// Release after Route has freed its native run, then let the late Go reply drain.
+	// Release after Route has freed its run, then let the late Go reply drain.
 	releaseHost()
 	select {
 	case <-returned:
@@ -234,11 +219,7 @@ func testCancellationAndLateHostReply(t *testing.T, engine Engine) {
 
 // Concurrent requests keep eligible pools separate; router copies share closed state.
 func TestConcurrentRoutesAndClose(t *testing.T) {
-	forEachEngine(t, testConcurrentRoutesAndClose)
-}
-
-func testConcurrentRoutesAndClose(t *testing.T, engine Engine) {
-	router := newRouter(t, engine, `{"type":"random","targets":["weak","strong"],"seed":7}`)
+	router := newRouter(t, `{"type":"random","targets":["weak","strong"],"seed":7}`)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := router.Route(ctx, input(), nil); !errors.Is(err, context.Canceled) {
@@ -275,7 +256,7 @@ func testConcurrentRoutesAndClose(t *testing.T, engine Engine) {
 			t.Fatal("closed router accepted a request")
 		}
 	}
-	racing := newRouter(t, engine, `{"type":"random","targets":["weak"]}`)
+	racing := newRouter(t, `{"type":"random","targets":["weak"]}`)
 	racingCopy, start := *racing, make(chan struct{})
 	go func() {
 		<-start
@@ -306,11 +287,7 @@ func testConcurrentRoutesAndClose(t *testing.T, engine Engine) {
 
 // Served-target attribution and agent/session metadata survive the bridge.
 func TestReplyAttributionAndMetadata(t *testing.T) {
-	forEachEngine(t, testReplyAttributionAndMetadata)
-}
-
-func testReplyAttributionAndMetadata(t *testing.T, engine Engine) {
-	router := newRouter(t, engine, `{"type":"advisor","executor_target":"strong","advisor_target":"judge","gate_trigger":"pattern","gate_trigger_pattern":"NEVER"}`)
+	router := newRouter(t, `{"type":"advisor","executor_target":"strong","advisor_target":"judge","gate_trigger":"pattern","gate_trigger_pattern":"NEVER"}`)
 	request := input()
 	request.Models["efficient"] = []string{"strong-model", "weak-model"}
 	outcome, err := router.Route(context.Background(), request, func(_ context.Context, work Work) (Reply, error) {
@@ -322,7 +299,7 @@ func testReplyAttributionAndMetadata(t *testing.T, engine Engine) {
 	if err != nil || len(outcome.SelectedModelIDs) != 1 || outcome.SelectedModelIDs[0] != "weak-model" || outcome.Response == nil {
 		t.Fatalf("outcome=%+v err=%v", outcome, err)
 	}
-	delegated := newRouter(t, engine, `{"type":"passthrough","target":"strong","subagents":{"type":"passthrough","target":"weak"}}`)
+	delegated := newRouter(t, `{"type":"passthrough","target":"strong","subagents":{"type":"passthrough","target":"weak"}}`)
 	for _, child := range []bool{false, true} {
 		request := input()
 		request.Models = map[string][]string{"any": {"strong-model"}}
@@ -353,7 +330,7 @@ func testReplyAttributionAndMetadata(t *testing.T, engine Engine) {
 	if _, err := delegated.Route(context.Background(), request, nil); err == nil {
 		t.Fatal("empty child pool selected a parent model")
 	}
-	plan := newRouter(t, engine, `{"type":"plan_execute","capable_target":"strong","efficient_target":"weak"}`)
+	plan := newRouter(t, `{"type":"plan_execute","capable_target":"strong","efficient_target":"weak"}`)
 	for _, tc := range []struct {
 		agent                string
 		child, final, edited bool

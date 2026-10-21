@@ -6,12 +6,15 @@ wazero, with no cgo dependency. Native builds can use the C ABI instead.
 
 ## Build and test
 
-Requires Go 1.25+. Test the embedded WASM backend without a Rust or C toolchain:
+Requires Go 1.25+. From the repository root, build the WASM guest before
+compiling the Go package. The script uses the repository's Rust toolchain and
+installs its `wasm32-wasip1` target. The generated binary is not checked in.
 
 ```sh
+scripts/build-go-wasm.sh
 cd bindings/go
 CGO_ENABLED=0 go test ./...
-go vet ./...
+CGO_ENABLED=0 go vet ./...
 ```
 
 For native tests, build the Rust library for the same platform as the Go host.
@@ -20,9 +23,9 @@ This path also requires cgo and a C compiler:
 ```sh
 cargo build -p switchyard-ffi --locked
 cd bindings/go
-go test -tags switchyard_native -race ./...
-GOEXPERIMENT=cgocheck2 go test -tags switchyard_native -race ./...
-go vet -tags switchyard_native ./...
+CGO_ENABLED=1 go test -tags switchyard_native -race ./...
+CGO_ENABLED=1 GOEXPERIMENT=cgocheck2 go test -tags switchyard_native -race ./...
+CGO_ENABLED=1 go vet -tags switchyard_native ./...
 ```
 
 Native builds load the shared library from `target/debug`; no static archive is required.
@@ -30,9 +33,8 @@ Rebuild Go with `go test -a` after changing the C header or native library; Go's
 cache does not track headers outside the package directory. Native artifacts
 are not downloaded or published by this package.
 
-After changing Rust code, run `scripts/build-go-wasm.sh` from the repository root
-to rebuild the embedded WASM file and its checksum. This requires the repository's
-Rust toolchain and its `wasm32-wasip1` target.
+Rebuild the WASM guest after changing Rust code. Native builds do not need the
+WASM binary. These commands build and test locally; they do not publish artifacts.
 
 ### Go versions
 
@@ -69,8 +71,8 @@ Import `encoding/json` and
 `github.com/NVIDIA-NeMo/Switchyard/bindings/go`. This is a source-only module;
 use a local Go module `replace` to point your host at this directory.
 
-`New` uses native code when built with `cgo` and `switchyard_native`; otherwise it
-uses WASM. Pass `WithEngine(WASM)` or `WithEngine(Native)` to choose explicitly.
+The backend is selected at build time: `cgo` with `switchyard_native` uses the
+native library; other builds use WASM. Both use `New(config)` and the same routing API.
 
 Supply the model groups needed by the configured algorithm. Composite needs
 `any` for eligible answer targets, plus `capable`, `efficient`, and `judge`.

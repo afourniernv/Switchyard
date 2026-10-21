@@ -8,33 +8,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sync"
 )
-
-// Engine selects the implementation used by a Router.
-type Engine uint8
-
-const (
-	// Auto selects native when the switchyard_native build is available, otherwise wasm.
-	Auto Engine = iota
-	// WASM selects the pure-Go wazero backend.
-	WASM
-	// Native selects the cgo backend when built with switchyard_native.
-	Native
-)
-
-type routerOptions struct {
-	engine Engine
-}
-
-// Option changes Router construction.
-type Option func(*routerOptions)
-
-// WithEngine selects Auto, WASM, or Native.
-func WithEngine(engine Engine) Option {
-	return func(options *routerOptions) { options.engine = engine }
-}
 
 type engineBackend interface {
 	route(context.Context, Input, HostCall) (Outcome, error)
@@ -95,40 +70,15 @@ type Outcome struct {
 }
 
 // New constructs an algorithm from {"algorithm": AlgorithmSpec, "targets": {alias: modelID}}.
-func New(config json.RawMessage, opts ...Option) (*Router, error) {
+func New(config json.RawMessage) (*Router, error) {
 	if !json.Valid(config) {
 		return nil, errors.New("Switchyard config must be valid JSON")
 	}
-	options := routerOptions{engine: Auto}
-	for _, option := range opts {
-		if option != nil {
-			option(&options)
-		}
-	}
-	backend, err := newBackend(options.engine, config)
+	backend, err := newBackend(config)
 	if err != nil {
 		return nil, err
 	}
 	return &Router{state: &routerState{backend: backend}}, nil
-}
-
-func newBackend(engine Engine, config json.RawMessage) (engineBackend, error) {
-	switch engine {
-	case Auto:
-		if nativeAvailable() {
-			return newNativeBackend(config)
-		}
-		return newWasmBackend(config)
-	case WASM:
-		return newWasmBackend(config)
-	case Native:
-		if !nativeAvailable() {
-			return nil, errors.New("Switchyard native backend is unavailable; build with cgo and switchyard_native")
-		}
-		return newNativeBackend(config)
-	default:
-		return nil, fmt.Errorf("unknown Switchyard engine %d", engine)
-	}
 }
 
 // Close prevents new runs and releases this Router's backend. Repeated calls and value copies are safe.

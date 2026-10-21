@@ -29,14 +29,7 @@ type nativeBackend struct {
 	ptr *C.SyRouter
 }
 
-func nativeAvailable() bool { return true }
-
-func backendUsesNative(backend engineBackend) bool {
-	_, ok := backend.(*nativeBackend)
-	return ok
-}
-
-func newNativeBackend(config json.RawMessage) (engineBackend, error) {
+func newBackend(config json.RawMessage) (engineBackend, error) {
 	if version := C.sy_abi_version(); version != C.SY_ABI_VERSION {
 		return nil, fmt.Errorf("Switchyard ABI version mismatch: library=%d, binding=%d", version, C.SY_ABI_VERSION)
 	}
