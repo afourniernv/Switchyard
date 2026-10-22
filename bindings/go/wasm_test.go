@@ -14,42 +14,53 @@ import (
 	"time"
 )
 
+// Parent and child identities must share the guest that owns their session state.
+func TestWasmSessionAffinity(t *testing.T) {
+	backend := &wasmBackend{slots: []*wasmSlot{{}, {}}}
+	request := input()
+	request.Metadata = &RequestMetadata{SessionID: "shared"}
+	parent := backend.slotFor(request)
+	request.Request = json.RawMessage(`{"messages":[{"role":"user","content":[{"type":"text","text":"child task"}]}]}`)
+	for _, agent := range []string{"a", "b", ""} {
+		request.Metadata.IsSubagent = true
+		request.Metadata.AgentID = agent
+		if backend.slotFor(request) != parent {
+			t.Errorf("child %q was assigned outside its parent's session guest", agent)
+		}
+	}
+}
+
 func TestWasmTrapIsolatesAndReplacesInstance(t *testing.T) {
 	config := testConfig(`{"type":"stage_router","picker":"efficient_first",` + stage + `}`)
-	backend, err := newWasmBackend(config)
+	backend, err := newWasmBackendWithPoolSize(config, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer backend.close()
-	otherBackend, err := newWasmBackend(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer otherBackend.close()
 	input, err := json.Marshal(input())
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	first, err := backend.slot.startRun(ctx, input)
+	first, err := backend.slots[0].startRun(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.close()
-	second, err := backend.slot.startRun(ctx, input)
+	second, err := backend.slots[0].startRun(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer second.close()
-	other, err := otherBackend.slot.startRun(ctx, input)
+	other, err := backend.slots[1].startRun(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer other.close()
 
-	backend.slot.mu.Lock()
+	backend.slots[0].mu.Lock()
 	_, allocationErr := first.gen.guest.call(ctx, "sy_alloc", uint64(^uint32(0)))
-	backend.slot.mu.Unlock()
+	backend.slots[0].mu.Unlock()
 	if !isWasmTrap(allocationErr) {
 		t.Fatalf("forced guest allocation panic returned %v", allocationErr)
 	}
@@ -68,9 +79,9 @@ func TestWasmTrapIsolatesAndReplacesInstance(t *testing.T) {
 		t.Fatalf("unrelated run returned %s", step)
 	}
 
-	replacement, err := backend.slot.startRun(ctx, input)
+	replacement, err := backend.slots[0].startRun(ctx, input)
 	if err != nil {
-		t.Fatalf("router did not replace the trapped instance: %v", err)
+		t.Fatalf("pool did not replace the trapped instance: %v", err)
 	}
 	defer replacement.close()
 	step, err = replacement.next(ctx)
@@ -81,27 +92,22 @@ func TestWasmTrapIsolatesAndReplacesInstance(t *testing.T) {
 
 func TestWasmClosedInstanceIsReplaced(t *testing.T) {
 	config := testConfig(`{"type":"stage_router","picker":"efficient_first",` + stage + `}`)
-	backend, err := newWasmBackend(config)
+	backend, err := newWasmBackendWithPoolSize(config, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer backend.close()
-	otherBackend, err := newWasmBackend(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer otherBackend.close()
 	input, err := json.Marshal(input())
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	closedRun, err := backend.slot.startRun(ctx, input)
+	closedRun, err := backend.slots[0].startRun(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closedRun.close()
-	otherRun, err := otherBackend.slot.startRun(ctx, input)
+	otherRun, err := backend.slots[1].startRun(ctx, input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +122,7 @@ func TestWasmClosedInstanceIsReplaced(t *testing.T) {
 	if err != nil || !strings.Contains(string(step), `"type":"done"`) {
 		t.Fatalf("unrelated instance returned step=%s err=%v", step, err)
 	}
-	replacement, err := backend.slot.startRun(ctx, input)
+	replacement, err := backend.slots[0].startRun(ctx, input)
 	if err != nil {
 		t.Fatalf("closed instance was not replaced: %v", err)
 	}
@@ -129,7 +135,7 @@ func TestWasmClosedInstanceIsReplaced(t *testing.T) {
 
 // A caller's expired context must not close an instance that other runs share.
 func TestWasmCancelledRunKeepsSharedInstance(t *testing.T) {
-	backend, err := newWasmBackend(json.RawMessage(`{"algorithm":` + composite + `,"targets":{"weak":"weak-model","strong":"strong-model","judge":"judge-model"}}`))
+	backend, err := newWasmBackendWithPoolSize(json.RawMessage(`{"algorithm":`+composite+`,"targets":{"weak":"weak-model","strong":"strong-model","judge":"judge-model"}}`), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,12 +173,12 @@ func TestWasmCancelledRunKeepsSharedInstance(t *testing.T) {
 }
 
 func TestWasmTrapIncludesGuestPanicMessage(t *testing.T) {
-	backend, err := newWasmBackend(testConfig(`{"type":"stage_router","picker":"efficient_first",` + stage + `}`))
+	backend, err := newWasmBackendWithPoolSize(testConfig(`{"type":"stage_router","picker":"efficient_first",`+stage+`}`), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer backend.close()
-	slot := backend.slot
+	slot := backend.slots[0]
 	slot.mu.Lock()
 	_, err = slot.gen.guest.call(context.Background(), "sy_alloc", uint64(^uint32(0)))
 	slot.mu.Unlock()
@@ -183,7 +189,7 @@ func TestWasmTrapIncludesGuestPanicMessage(t *testing.T) {
 
 // Pending calls and same-session waiters yield without blocking other runs.
 func TestWasmNextWhileHostCallPending(t *testing.T) {
-	backend, err := newWasmBackend(json.RawMessage(`{"algorithm":` + composite + `,"targets":{"weak":"weak-model","strong":"strong-model","judge":"judge-model"}}`))
+	backend, err := newWasmBackendWithPoolSize(json.RawMessage(`{"algorithm":`+composite+`,"targets":{"weak":"weak-model","strong":"strong-model","judge":"judge-model"}}`), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +201,7 @@ func TestWasmNextWhileHostCallPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	run, err := backend.slot.startRun(ctx, data)
+	run, err := backend.slots[0].startRun(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +213,7 @@ func TestWasmNextWhileHostCallPending(t *testing.T) {
 	if step, err := run.next(ctx); err != nil || step != nil {
 		t.Fatalf("read with an unanswered call returned step=%s err=%v", step, err)
 	}
-	waiting, err := backend.slot.startRun(ctx, data)
+	waiting, err := backend.slots[0].startRun(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}

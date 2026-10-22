@@ -98,10 +98,16 @@ the final selected provider response separately.
 
 `Route` waits in its calling goroutine. A host that needs immediate return can
 call it in a goroutine; waiting for routing steps does not occupy a blocked
-native-reader thread. Each WASM router shares one guest instance, so Switchyard
-owns its session state. Guest calls are serialized; host callbacks can overlap.
-CPU-bound throughput is lower than with separate guests.
-A trap fails every active run on that router. Its instance is replaced and retained state is lost.
+native-reader thread. Each WASM router uses a pool of `GOMAXPROCS` guest instances.
+A session ID keeps the parent and all its child agents on the same instance.
+Without a session ID, the first user message is used, or requests are assigned round-robin.
+Guest calls are serialized within each instance; host callbacks can overlap.
+A trap fails runs sharing that instance. It is replaced and its retained state is lost.
+
+Each instance has its own algorithm state. Router-wide budgets and counters are
+not shared.
+Message-based assignment does not give requests without session IDs persistent
+session state.
 
 While a WASM run is idle, Go re-enters it every 5 ms to advance Rust timers and
 session waiters. Deadline handling can be delayed by that interval and scheduling load.

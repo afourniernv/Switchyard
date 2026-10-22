@@ -10,6 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,7 +20,8 @@ import (
 
 type wasmBackend struct {
 	runtime   *wasmRuntime
-	slot      *wasmSlot
+	slots     []*wasmSlot
+	next      atomic.Uint64
 	active    atomic.Int64
 	closed    atomic.Bool
 	lifecycle sync.Mutex
@@ -63,20 +67,26 @@ type wasmRun struct {
 }
 
 func newBackend(config json.RawMessage) (engineBackend, error) {
-	return newWasmBackend(config)
+	return newWasmBackendWithPoolSize(config, runtime.GOMAXPROCS(0))
 }
 
-func newWasmBackend(config json.RawMessage) (*wasmBackend, error) {
+func newWasmBackendWithPoolSize(config json.RawMessage, size int) (*wasmBackend, error) {
+	if size < 1 {
+		return nil, errors.New("Switchyard wasm instance pool must have at least one instance")
+	}
 	runtime, err := newWasmRuntime()
 	if err != nil {
 		return nil, err
 	}
-	backend := &wasmBackend{runtime: runtime}
-	backend.slot = &wasmSlot{owner: backend, config: bytesClone(config)}
-	backend.slot.gen, err = backend.newGeneration(context.Background(), backend.slot.config)
-	if err != nil {
-		backend.close()
-		return nil, fmt.Errorf("initialize Switchyard wasm instance: %w", err)
+	backend := &wasmBackend{runtime: runtime, slots: make([]*wasmSlot, size)}
+	for index := range backend.slots {
+		slot := &wasmSlot{owner: backend, config: bytesClone(config)}
+		slot.gen, err = backend.newGeneration(context.Background(), slot.config)
+		if err != nil {
+			backend.close()
+			return nil, fmt.Errorf("initialize Switchyard wasm instance %d: %w", index, err)
+		}
+		backend.slots[index] = slot
 	}
 	return backend, nil
 }
@@ -224,9 +234,14 @@ func (backend *wasmBackend) close() {
 
 func (backend *wasmBackend) finalizeClose() {
 	backend.finalize.Do(func() {
-		backend.slot.mu.Lock()
-		backend.slot.closeLocked(errors.New("Switchyard router is closed"))
-		backend.slot.mu.Unlock()
+		for _, slot := range backend.slots {
+			if slot == nil {
+				continue
+			}
+			slot.mu.Lock()
+			slot.closeLocked(errors.New("Switchyard router is closed"))
+			slot.mu.Unlock()
+		}
 		backend.runtime.closeAll()
 	})
 }
@@ -284,7 +299,7 @@ func (backend *wasmBackend) route(ctx context.Context, input Input, call HostCal
 	if err != nil {
 		return Outcome{}, err
 	}
-	run, err := backend.slot.startRun(ctx, data)
+	run, err := backend.slotFor(input).startRun(ctx, data)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -354,6 +369,55 @@ func (backend *wasmBackend) route(ctx context.Context, input Input, call HostCal
 			return Outcome{}, errors.New("unknown Switchyard step: " + step.Type)
 		}
 	}
+}
+
+func (backend *wasmBackend) slotFor(input Input) *wasmSlot {
+	if metadata := input.Metadata; metadata != nil && metadata.SessionID != "" {
+		return backend.slotForKey("session\x00" + metadata.SessionID)
+	}
+	// Without a session ID, keep message-keyed retention on one instance.
+	if text, ok := firstUserText(input.Request); ok {
+		return backend.slotForKey("message\x00" + text)
+	}
+	index := backend.next.Add(1) - 1
+	return backend.slots[index%uint64(len(backend.slots))]
+}
+
+func (backend *wasmBackend) slotForKey(key string) *wasmSlot {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(key))
+	return backend.slots[hash.Sum64()%uint64(len(backend.slots))]
+}
+
+// firstUserText matches libsy's Message::text_content("") on the first user message.
+func firstUserText(request json.RawMessage) (string, bool) {
+	var parsed struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(request, &parsed) != nil {
+		return "", false
+	}
+	for _, message := range parsed.Messages {
+		if message.Role != "user" {
+			continue
+		}
+		var text strings.Builder
+		found := false
+		for _, block := range message.Content {
+			if block.Type == "text" || block.Type == "refusal" {
+				text.WriteString(block.Text)
+				found = true
+			}
+		}
+		return text.String(), found
+	}
+	return "", false
 }
 
 func (slot *wasmSlot) startRun(ctx context.Context, input []byte) (*wasmRun, error) {
