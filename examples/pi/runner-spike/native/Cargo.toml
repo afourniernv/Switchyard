@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pi-runner-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# This experimental addon is built explicitly, not by the main workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt", "dyn-symbols"] }
+napi-derive = "3"
+serde_json = "1"
+switchyard-protocol = { path = "../../../../crates/protocol" }
+switchyard-runner = { path = "../../../../crates/switchyard-runner" }
+
+[build-dependencies]
+napi-build = "2"

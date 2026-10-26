@@ -1,0 +1,5 @@
+/native/Cargo.lock
+/native/target/
+/native/*.node
+/smoke-output/
+/__pycache__/

@@ -1,0 +1,43 @@
+schema_version = 1
+
+# Stage makes no provider calls in this fixture. Pi owns the final request.
+[llm_clients.standard]
+format = "openai_chat"
+base_url = "http://127.0.0.1:48663/unused-standard"
+max_retries = 0
+
+[llm_clients.local]
+format = "openai_chat"
+base_url = "http://127.0.0.1:48663/unused-local"
+max_retries = 0
+
+[targets.efficient]
+id = "standard/efficient"
+llm_client = "standard"
+
+[targets.capable]
+id = "standard/capable"
+llm_client = "standard"
+
+[targets.local_efficient]
+id = "local/efficient"
+llm_client = "local"
+local = true
+
+[targets.local_capable]
+id = "local/capable"
+llm_client = "local"
+local = true
+
+[routes.demo]
+id = "switchyard/runner-spike"
+type = "stage_router"
+efficient_target = "efficient"
+capable_target = "capable"
+picker = "efficient_first"
+confidence_threshold = 0.5
+
+[routes.demo.local]
+scope = "task"
+require_explicit_signal = true
+target_overrides = { efficient = "local_efficient", capable = "local_capable" }
